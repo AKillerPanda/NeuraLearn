@@ -572,7 +572,7 @@ class KnowledgeGraph:
 			self._spectral_cache[cache_key] = vals
 			return vals
 		try:
-			vals, _ = eigsh(L.astype(np.float64), k=k, which="SM", sigma=-0.5)
+			vals, _ = eigsh(L.astype(np.float64), k=k, which="LM", sigma=-0.5)
 		except ArpackNoConvergence as exc:
 			# Use whatever eigenvalues ARPACK managed to converge
 			vals = exc.eigenvalues if hasattr(exc, 'eigenvalues') and len(exc.eigenvalues) > 0 else np.array([0.0])
@@ -596,12 +596,37 @@ class KnowledgeGraph:
 		Ratio  λ₂ / λ_max  — normalised connectivity measure in [0, 1].
 
 		A large spectral gap indicates strong expander-like connectivity.
+		Uses ARPACK to compute both the second-smallest and largest
+		eigenvalues of the Laplacian independently.
 		"""
-		vals = self.spectral_eigenvalues(k=6)
+		vals = self.spectral_eigenvalues(k=3)
 		if len(vals) < 2:
 			return 0.0
-		lam_max = vals[-1]
-		return float(vals[1] / lam_max) if lam_max > 1e-12 else 0.0
+		lam2 = float(vals[1])
+		if lam2 < 1e-12:
+			return 0.0
+		# Compute actual λ_max (largest eigenvalue) separately
+		L = self.build_laplacian()
+		n = L.shape[0]
+		if n < 3:
+			# For tiny graphs, the smallest-k already covers all eigenvalues
+			lam_max = float(vals[-1])
+		else:
+			try:
+				lam_max_arr = eigsh(
+					L.astype(np.float64), k=1, which="LM",
+					return_eigenvectors=False,
+				)
+				lam_max = float(abs(lam_max_arr[0]))
+			except ArpackNoConvergence as exc:
+				lam_max = (
+					float(abs(exc.eigenvalues[0]))
+					if hasattr(exc, "eigenvalues") and len(exc.eigenvalues) > 0
+					else float(vals[-1])
+				)
+			except Exception:
+				lam_max = float(vals[-1])
+		return float(lam2 / lam_max) if lam_max > 1e-12 else 0.0
 
 	def fiedler_vector(self) -> np.ndarray:
 		"""
@@ -627,7 +652,7 @@ class KnowledgeGraph:
 			self._spectral_cache[cache_key] = v
 			return v
 		try:
-			vals_f, vecs_f = eigsh(L.astype(np.float64), k=k, which="SM", sigma=-0.5)
+			vals_f, vecs_f = eigsh(L.astype(np.float64), k=k, which="LM", sigma=-0.5)
 		except ArpackNoConvergence as exc:
 			if hasattr(exc, 'eigenvalues') and len(exc.eigenvalues) >= 2:
 				vals_f = exc.eigenvalues
@@ -666,7 +691,7 @@ class KnowledgeGraph:
 			self._spectral_cache[cache_key] = emb
 			return emb
 		try:
-			vals, vecs = eigsh(Ln.astype(np.float64), k=nev, which="SM", sigma=-0.5)
+			vals, vecs = eigsh(Ln.astype(np.float64), k=nev, which="LM", sigma=-0.5)
 		except ArpackNoConvergence as exc:
 			if hasattr(exc, 'eigenvalues') and len(exc.eigenvalues) >= 2:
 				vals = exc.eigenvalues
@@ -821,7 +846,7 @@ class KnowledgeGraph:
 					# Vectorised max-depth propagation
 					new_depths = depth[parents] + 1
 					np.maximum.at(depth, children, new_depths)
-					in_deg[children] -= 1
+					np.subtract.at(in_deg, children, 1)
 				frontier = np.unique(children[in_deg[children] == 0])
 			else:
 				break

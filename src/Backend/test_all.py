@@ -206,15 +206,14 @@ def test_graph():
         assert kg.get_topic_by_name("New1") is not None
     _test("rebuild_from_spec clears and rebuilds", t_rebuild)
 
-    # ---- missing prerequisite in spec ----
+    # ---- missing prerequisite in spec is silently skipped ----
     def t_missing_prereq_spec():
         spec = [{"name": "A", "prerequisite_names": ["NonExistent"]}]
-        try:
-            KnowledgeGraph.from_spec(spec)
-            assert False
-        except ValueError:
-            pass
-    _test("Missing prereq in spec raises ValueError", t_missing_prereq_spec)
+        kg = KnowledgeGraph.from_spec(spec)
+        assert kg.num_topics == 1, f"expected 1 topic, got {kg.num_topics}"
+        # Missing prereq silently skipped — A has no prerequisites
+        assert len(kg.topics[0].prerequisites) == 0
+    _test("Missing prereq in spec silently skipped", t_missing_prereq_spec)
 
     # ---- edge index / degree tensors ----
     def t_edge_index():
@@ -479,6 +478,26 @@ def test_graph():
         assert depth[c.topic_id] == 2
         assert depth[d.topic_id] == 1
     _test("Topological depth vector", t_topo_depth)
+
+    # ---- topological depth vector: fan-in ----
+    def t_topo_depth_fanin():
+        kg = KnowledgeGraph()
+        a = kg.create_topic("A")
+        b = kg.create_topic("B")
+        c = kg.create_topic("C")
+        d = kg.create_topic("D")
+        # A→C, B→C (fan-in on C), C→D
+        kg.add_prerequisites_bulk([
+            (a.topic_id, c.topic_id),
+            (b.topic_id, c.topic_id),
+            (c.topic_id, d.topic_id),
+        ])
+        depth = kg.topological_depth_vector()
+        assert depth[a.topic_id] == 0, f"A root depth should be 0: {depth[a.topic_id]}"
+        assert depth[b.topic_id] == 0, f"B root depth should be 0: {depth[b.topic_id]}"
+        assert depth[c.topic_id] == 1, f"C depth should be 1: {depth[c.topic_id]}"
+        assert depth[d.topic_id] == 2, f"D depth should be 2: {depth[d.topic_id]}"
+    _test("Topological depth vector (fan-in)", t_topo_depth_fanin)
 
     # ---- Laplacian caching ----
     def t_laplacian_cache():
@@ -921,7 +940,7 @@ def test_sds():
 
     # ---- correct_phrase: misspelled word gets suggestions ----
     def t_phrase_misspelled():
-        result = correct_phrase("guittar pianno", top_k=3, n_agents=30, max_iter=15)
+        result = correct_phrase("guittar pianno", top_k=3, n_agents=30, max_iter=15, seed=42)
         assert len(result) == 2, f"expected 2 words, got {len(result)}"
         # Each should be a list of suggestions
         for suggestions in result:
@@ -931,7 +950,7 @@ def test_sds():
 
     # ---- correct_phrase: mixed known and unknown ----
     def t_phrase_mixed():
-        result = correct_phrase("the guittar", top_k=3, n_agents=30, max_iter=15)
+        result = correct_phrase("the guittar", top_k=3, n_agents=30, max_iter=15, seed=42, verbose=False)
         assert len(result) == 2
         # "the" should pass through
         assert result[0] == [("the", 1.0)]

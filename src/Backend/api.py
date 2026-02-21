@@ -37,7 +37,18 @@ from Webscraping import get_learning_spec
 from graph import KnowledgeGraph, TopicLevel
 from ACO import LearningPathACO
 from SDS import spell_correct, correct_phrase, load_dictionary
-from difficulty_gnn import predict_difficulty, get_difficulty_explanation, get_smart_recommendation
+# difficulty_gnn imports torch eagerly — defer to first use
+_predict_difficulty = None
+_get_difficulty_explanation = None
+_get_smart_recommendation = None
+
+def _ensure_difficulty_gnn():
+    global _predict_difficulty, _get_difficulty_explanation, _get_smart_recommendation
+    if _predict_difficulty is None:
+        from difficulty_gnn import predict_difficulty, get_difficulty_explanation, get_smart_recommendation
+        _predict_difficulty = predict_difficulty
+        _get_difficulty_explanation = get_difficulty_explanation
+        _get_smart_recommendation = get_smart_recommendation
 
 # ── App setup ───────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -961,12 +972,13 @@ def difficulty_analysis(skill: str):
                 mastered_ids.add(int(part))
 
     try:
-        scores = predict_difficulty(kg, mastered_ids, skill_key=skill.lower())
+        _ensure_difficulty_gnn()
+        scores = _predict_difficulty(kg, mastered_ids, skill_key=skill.lower())
         explanations = {
-            str(tid): get_difficulty_explanation(kg, tid, score)
+            str(tid): _get_difficulty_explanation(kg, tid, score)
             for tid, score in scores.items()
         }
-        recommendation = get_smart_recommendation(
+        recommendation = _get_smart_recommendation(
             kg, mastered_ids, skill_key=skill.lower(),
             precomputed_scores=scores,
         )

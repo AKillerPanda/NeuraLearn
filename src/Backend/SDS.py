@@ -474,6 +474,7 @@ def correct_phrase(
 	top_k: int = 3,
 	n_agents: int = 200,
 	max_iter: int = 50,
+	seed: int | None = None,
 	verbose: bool = False,
 ) -> list[list[tuple[str, float]]]:
 	"""
@@ -498,6 +499,7 @@ def correct_phrase(
 				top_k=top_k,
 				n_agents=n_agents,
 				max_iter=max_iter,
+				seed=seed,
 				dictionary=dictionary,
 				verbose=verbose,
 			)
