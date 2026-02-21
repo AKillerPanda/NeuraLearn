@@ -45,19 +45,34 @@ export interface SpellResult {
 
 const API_BASE = "/api";
 
+const REQUEST_TIMEOUT_MS = 90_000; // 90 s — webscraping can be slow
+
 async function post<T>(path: string, body: Record<string, unknown>): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error ?? `API ${res.status}`);
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error ?? `API ${res.status}`);
+    }
+
+    return res.json() as Promise<T>;
+  } catch (e: unknown) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error("Request timed out — the server took too long to respond.");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
   }
-
-  return res.json() as Promise<T>;
 }
 
 /* ------------------------------------------------------------------ */
@@ -75,6 +90,7 @@ function styleNode(node: Node): Node {
   const palette = LEVEL_COLOURS[difficulty ?? ""] ?? LEVEL_COLOURS.intermediate;
   return {
     ...node,
+    type: "custom",
     style: {
       background: palette.bg,
       border: `2px solid ${palette.border}`,

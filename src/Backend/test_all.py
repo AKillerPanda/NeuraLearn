@@ -31,7 +31,7 @@ def _test(name: str, fn):
         print(f"  [PASS] {name}")
     except Exception as e:
         _FAIL += 1
-        msg = f"  [FAIL] {name}  →  {e}"
+        msg = f"  [FAIL] {name}  ->  {e}"
         print(msg)
         _ERRORS.append(msg)
         traceback.print_exc(limit=3)
@@ -438,7 +438,7 @@ def test_aco():
         assert len(path) == 5, f"path length {len(path)}"
         # For a linear chain there's only one valid order
         assert path == [0, 1, 2, 3, 4], f"expected [0..4] got {path}"
-    _test("ACO linear chain → unique order", t_aco_linear)
+    _test("ACO linear chain -> unique order", t_aco_linear)
 
     # ---- branching DAG: prerequisites respected ----
     def t_aco_branching():

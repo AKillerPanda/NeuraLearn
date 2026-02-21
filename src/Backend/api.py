@@ -23,7 +23,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 # ── Backend imports ─────────────────────────────────────────────────
-from Webscraping import get_learning_plan, get_learning_spec
+from Webscraping import get_learning_spec
 from graph import KnowledgeGraph, TopicLevel
 from ACO import LearningPathACO
 from SDS import spell_correct, correct_phrase, load_dictionary
@@ -85,7 +85,7 @@ def _layout_nodes(kg: KnowledgeGraph) -> list[dict[str, Any]]:
         start_x = 400 - total_width / 2
 
         for i, t in enumerate(layer_topics):
-            level_str = t.level.value if hasattr(t.level, "value") else str(t.level)
+            level_str = t.level.name.lower() if hasattr(t.level, "name") else str(t.level)
             node_type = "input" if d == 0 else ("output" if d == max_depth else "default")
             nodes.append({
                 "id":       str(t.topic_id),

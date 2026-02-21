@@ -57,6 +57,10 @@ import {
 import { Sheet, SheetContent, SheetTrigger } from "../components/ui/sheet";
 import { toast } from "sonner";
 import { Toaster } from "../components/ui/sonner";
+import { CustomNode } from "../components/CustomNode";
+
+/* ── Constants (stable ref — defined outside component to avoid re-renders) ── */
+const nodeTypes = { custom: CustomNode } as const;
 
 /* ── Types ──────────────────────────────────────────────────────── */
 type LoadState = "idle" | "loading" | "done" | "error";
@@ -458,6 +462,7 @@ export function KnowledgeGraph() {
             <ReactFlow
               nodes={nodes}
               edges={edges}
+              nodeTypes={nodeTypes}
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}
               onConnect={onConnect}
@@ -576,6 +581,7 @@ export function KnowledgeGraph() {
               <ReactFlow
                 nodes={subGraphData.nodes}
                 edges={subGraphData.edges}
+                nodeTypes={nodeTypes}
                 fitView
               >
                 <Background />
