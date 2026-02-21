@@ -1,6 +1,6 @@
 """
-NeuraLearn — Flask REST API  (spectral layout + vectorised)
-============================================================
+NeuraLearn — Flask REST API  (spectral layout + vectorised + full feature surface)
+===================================================================================
 Exposes the backend algorithms (Webscraping, KnowledgeGraph, ACO, SDS)
 as JSON endpoints that the React frontend can consume.
 
@@ -13,6 +13,9 @@ Endpoints
 POST /api/generate       — Build knowledge graph + learning paths for a skill
 POST /api/spell-check    — SDS spell-correction for a word / phrase
 POST /api/sub-graph      — Generate a sub-graph for a specific subtopic
+POST /api/master         — Mark a topic as mastered (prerequisite-validated)
+POST /api/shortest-path  — Shortest path to a target topic
+GET  /api/progress/<skill> — Get mastery progress for a stored graph
 GET  /api/health         — Health check
 """
 from __future__ import annotations
@@ -44,6 +47,10 @@ log = logging.getLogger(__name__)
 _dict = load_dictionary()
 log.info("Dictionary loaded: %d words", len(_dict))
 
+# In-memory graph store: skill (lowercased) → (KnowledgeGraph, spec_list)
+# Keeps graphs alive for mastery tracking & shortest-path queries
+_graph_store: dict[str, tuple[KnowledgeGraph, list[dict]]] = {}
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Helpers
@@ -58,7 +65,7 @@ _LEVEL_TO_DIFFICULTY: dict[str, str] = {
 _LEVEL_ORDER = ["foundational", "intermediate", "advanced", "expert"]
 
 
-def _layout_nodes(kg: KnowledgeGraph) -> list[dict[str, Any]]:
+def _layout_nodes(kg: KnowledgeGraph, spec: list[dict] | None = None) -> list[dict[str, Any]]:
     """
     Sugiyama-style layered layout with spectral cross-minimisation.
 
@@ -68,6 +75,10 @@ def _layout_nodes(kg: KnowledgeGraph) -> list[dict[str, Any]]:
        Fiedler ordering for the root layer.
     3. Spacing — enforce a hard minimum gap (NODE_W) so nodes never overlap
        regardless of how many share a layer.
+
+    Also attaches:
+      - spectral cluster label for colour-coding
+      - learning resources from the scrape spec
 
     The result is a clean, readable DAG where every level is evenly spaced,
     edges flow strictly downward, and no two nodes collide.
@@ -138,6 +149,24 @@ def _layout_nodes(kg: KnowledgeGraph) -> list[dict[str, Any]]:
             layer_rank[t.topic_id] = float(i)
 
     # ── absolute pixel positions (centred, no-overlap) ──────────────
+    # Pre-compute spectral cluster labels for colour-coding
+    cluster_map: dict[int, int] = {}
+    if kg.num_topics >= 3:
+        try:
+            n_clust = max(2, min(kg.num_topics // 3, 5))
+            labels = kg.spectral_clustering(n_clusters=n_clust)
+            for tid in kg.topics:
+                cluster_map[tid] = int(labels[tid])
+        except Exception:
+            pass
+
+    # Build resource lookup: lowercase topic name → list of resource dicts
+    resource_map: dict[str, list[dict]] = {}
+    if spec:
+        for s in spec:
+            key = s.get("name", "").lower()
+            resource_map[key] = s.get("resources", [])
+
     nodes: list[dict[str, Any]] = []
     for d in range(max_depth + 1):
         lt = layers.get(d, [])
@@ -154,6 +183,9 @@ def _layout_nodes(kg: KnowledgeGraph) -> list[dict[str, Any]]:
             prereq_names = sorted(kg.topics[p].name for p in t.prerequisites)
             unlock_names = sorted(kg.topics[u].name for u in t.unlocks)
 
+            # Learning resources from scrape
+            resources = resource_map.get(t.name.lower(), [])
+
             nodes.append({
                 "id":       str(t.topic_id),
                 "type":     node_type,
@@ -168,6 +200,8 @@ def _layout_nodes(kg: KnowledgeGraph) -> list[dict[str, Any]]:
                     "unlocks":      unlock_names,
                     "depth":        d,
                     "stepIndex":    topo.index(t),
+                    "cluster":      cluster_map.get(t.topic_id, 0),
+                    "resources":    resources,
                 },
             })
 
@@ -275,6 +309,7 @@ def _build_learning_paths(
             "duration":    f"{len(aco_path)} topics",
             "difficulty":  "intermediate",
             "nodeIds":     aco_ids,
+            "convergence": aco.history,
         })
     except Exception as exc:
         log.warning("ACO failed: %s", exc)
@@ -299,6 +334,40 @@ def _build_learning_paths(
         })
 
     return paths
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Analytics helper
+# ═══════════════════════════════════════════════════════════════════
+def _graph_stats(kg: KnowledgeGraph) -> dict[str, Any]:
+    """Compute spectral / topological analytics for the graph."""
+    stats: dict[str, Any] = {
+        "numTopics": kg.num_topics,
+        "numEdges":  int(kg.build_edge_index().size(1)),
+    }
+    try:
+        stats["algebraicConnectivity"] = round(kg.algebraic_connectivity(), 4)
+    except Exception:
+        stats["algebraicConnectivity"] = None
+    try:
+        stats["spectralGap"] = round(kg.spectral_gap(), 4)
+    except Exception:
+        stats["spectralGap"] = None
+    try:
+        stats["connectedComponents"] = kg.betti_0()
+    except Exception:
+        stats["connectedComponents"] = None
+    try:
+        out_d = kg.out_degree()
+        in_d = kg.in_degree()
+        ids = sorted(kg.topics.keys())
+        stats["avgOutDegree"] = round(float(out_d[ids].float().mean()), 2)
+        stats["avgInDegree"]  = round(float(in_d[ids].float().mean()), 2)
+        stats["maxOutDegree"] = int(out_d[ids].max())
+        stats["maxInDegree"]  = int(in_d[ids].max())
+    except Exception:
+        pass
+    return stats
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -337,9 +406,12 @@ def generate_graph():
         kg = KnowledgeGraph.from_spec(spec)
         t_graph = time.time() - t1
 
-        # 3. Layout + edges + paths (should be < 50 ms total)
+        # Store graph for mastery / shortest-path queries
+        _graph_store[skill.lower()] = (kg, spec)
+
+        # 3. Layout + edges + paths + stats (should be < 50 ms total)
         t2 = time.time()
-        nodes = _layout_nodes(kg)
+        nodes = _layout_nodes(kg, spec)
         t_layout = time.time() - t2
 
         t3 = time.time()
@@ -350,13 +422,17 @@ def generate_graph():
         paths = _build_learning_paths(kg)
         t_paths = time.time() - t4
 
+        t5 = time.time()
+        stats = _graph_stats(kg)
+        t_stats = time.time() - t5
+
         elapsed = time.time() - t0
-        compute_ms = (t_graph + t_layout + t_edges + t_paths) * 1000
+        compute_ms = (t_graph + t_layout + t_edges + t_paths + t_stats) * 1000
         log.info(
             "generate  skill=%r  topics=%d  elapsed=%.2fs  "
-            "(scrape=%.2fs  graph=%.1fms  layout=%.1fms  edges=%.1fms  paths=%.1fms)",
+            "(scrape=%.2fs  graph=%.1fms  layout=%.1fms  edges=%.1fms  paths=%.1fms  stats=%.1fms)",
             skill, kg.num_topics, elapsed,
-            t_scrape, t_graph * 1000, t_layout * 1000, t_edges * 1000, t_paths * 1000,
+            t_scrape, t_graph * 1000, t_layout * 1000, t_edges * 1000, t_paths * 1000, t_stats * 1000,
         )
 
         return jsonify({
@@ -364,6 +440,7 @@ def generate_graph():
             "nodes":   nodes,
             "edges":   edges,
             "paths":   paths,
+            "stats":   stats,
             "elapsed": round(elapsed, 2),
             "timing": {
                 "scrape_s":    round(t_scrape, 3),
@@ -371,6 +448,7 @@ def generate_graph():
                 "layout_ms":   round(t_layout * 1000, 2),
                 "edges_ms":    round(t_edges * 1000, 2),
                 "paths_ms":    round(t_paths * 1000, 2),
+                "stats_ms":    round(t_stats * 1000, 2),
                 "compute_ms":  round(compute_ms, 2),
             },
         })
@@ -407,11 +485,12 @@ def sub_graph():
         t_graph = time.time() - t1
 
         t2 = time.time()
-        nodes = _layout_nodes(kg)
+        nodes = _layout_nodes(kg, spec)
         t_layout = time.time() - t2
 
         edges = _build_edges(kg)
         paths = _build_learning_paths(kg)
+        stats = _graph_stats(kg)
         compute_ms = (time.time() - t1) * 1000
 
         log.info(
@@ -424,6 +503,7 @@ def sub_graph():
             "nodes": nodes,
             "edges": edges,
             "paths": paths,
+            "stats": stats,
             "timing": {
                 "scrape_s":   round(t_scrape, 3),
                 "compute_ms": round(compute_ms, 2),
@@ -472,6 +552,118 @@ def spell_check():
     except Exception as exc:
         log.error("spell-check failed: %s", exc)
         return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/master", methods=["POST"])
+def master_topic():
+    """
+    Mark a topic as mastered (prerequisite-validated).
+
+    Request JSON:  { "skill": "Machine Learning", "topicId": "3" }
+    Response JSON: { "success": true, "mastered": [...], "available": [...],
+                     "locked": [...], "progress": 0.42 }
+    """
+    body = request.get_json(silent=True) or {}
+    skill = (body.get("skill") or "").strip().lower()
+    topic_id_str = body.get("topicId", "")
+
+    if not skill or topic_id_str == "":
+        return jsonify({"error": "missing 'skill' and/or 'topicId'"}), 400
+
+    entry = _graph_store.get(skill)
+    if not entry:
+        return jsonify({"error": f"no graph stored for '{skill}' — generate first"}), 404
+
+    kg, _ = entry
+    try:
+        tid = int(topic_id_str)
+    except (ValueError, TypeError):
+        return jsonify({"error": f"invalid topicId: {topic_id_str}"}), 400
+
+    if tid not in kg.topics:
+        return jsonify({"error": f"topic {tid} not found in graph"}), 404
+
+    success = kg.master_topic(tid)
+    if not success:
+        missing = [
+            kg.topics[p].name for p in kg.topics[tid].prerequisites
+            if not kg.topics[p].mastered
+        ]
+        return jsonify({
+            "success": False,
+            "reason": f"prerequisites not met: {', '.join(missing)}",
+        }), 409
+
+    return jsonify({
+        "success":   True,
+        "mastered":  [{"id": str(t.topic_id), "name": t.name} for t in kg.get_mastered()],
+        "available": [{"id": str(t.topic_id), "name": t.name} for t in kg.get_available()],
+        "locked":    [{"id": str(t.topic_id), "name": t.name} for t in kg.get_locked()],
+        "progress":  round(kg.mastery_progress(), 4),
+    })
+
+
+@app.route("/api/shortest-path", methods=["POST"])
+def shortest_path():
+    """
+    Find the minimum topics needed to reach a target topic.
+
+    Request JSON:  { "skill": "Machine Learning", "targetId": "7" }
+    Response JSON: { "path": [ {"id": "0", "name": "...", "mastered": false}, ... ] }
+    """
+    body = request.get_json(silent=True) or {}
+    skill = (body.get("skill") or "").strip().lower()
+    target_str = body.get("targetId", "")
+
+    if not skill or target_str == "":
+        return jsonify({"error": "missing 'skill' and/or 'targetId'"}), 400
+
+    entry = _graph_store.get(skill)
+    if not entry:
+        return jsonify({"error": f"no graph stored for '{skill}' — generate first"}), 404
+
+    kg, _ = entry
+    try:
+        target_id = int(target_str)
+    except (ValueError, TypeError):
+        return jsonify({"error": f"invalid targetId: {target_str}"}), 400
+
+    if target_id not in kg.topics:
+        return jsonify({"error": f"topic {target_id} not found"}), 404
+
+    sp = kg.shortest_path_to(target_id)
+    return jsonify({
+        "path": [
+            {
+                "id":       str(t.topic_id),
+                "name":     t.name,
+                "mastered": t.mastered,
+                "level":    t.level.name.lower(),
+            }
+            for t in sp
+        ],
+    })
+
+
+@app.route("/api/progress/<skill>", methods=["GET"])
+def get_progress(skill: str):
+    """
+    Return mastery state for a previously generated graph.
+
+    Response JSON: { "mastered": [...], "available": [...],
+                     "locked": [...], "progress": 0.42 }
+    """
+    entry = _graph_store.get(skill.lower())
+    if not entry:
+        return jsonify({"error": f"no graph stored for '{skill}'"}), 404
+
+    kg, _ = entry
+    return jsonify({
+        "mastered":  [{"id": str(t.topic_id), "name": t.name} for t in kg.get_mastered()],
+        "available": [{"id": str(t.topic_id), "name": t.name} for t in kg.get_available()],
+        "locked":    [{"id": str(t.topic_id), "name": t.name} for t in kg.get_locked()],
+        "progress":  round(kg.mastery_progress(), 4),
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════

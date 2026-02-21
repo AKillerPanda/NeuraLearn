@@ -9,6 +9,8 @@ interface CustomNodeData {
   prerequisites?: string[];
   unlocks?: string[];
   depth?: number;
+  cluster?: number;
+  resources?: { title: string; url: string; source: string; type: string }[];
 }
 
 const LEVEL_BADGE: Record<string, string> = {
@@ -25,19 +27,31 @@ const DEPTH_GLOW: Record<number, string> = {
   3: "shadow-red-200/60",
 };
 
+/* Spectral cluster → border/ring accent colour */
+const CLUSTER_COLOURS: string[] = [
+  "ring-blue-400/50",
+  "ring-emerald-400/50",
+  "ring-amber-400/50",
+  "ring-rose-400/50",
+  "ring-violet-400/50",
+  "ring-cyan-400/50",
+];
+
 function CustomNodeInner({ data }: { data: CustomNodeData }) {
   const levelClass = LEVEL_BADGE[data.level ?? ""] ?? "bg-gray-100 text-gray-600 border-gray-200";
   const glowClass = DEPTH_GLOW[data.depth ?? 0] ?? "shadow-purple-200/60";
+  const clusterRing = CLUSTER_COLOURS[(data.cluster ?? 0) % CLUSTER_COLOURS.length];
   const prereqs = data.prerequisites ?? [];
   const unlocks = data.unlocks ?? [];
   const isRoot = prereqs.length === 0;
   const isLeaf = unlocks.length === 0;
+  const resourceCount = data.resources?.length ?? 0;
 
   return (
     <div
       className={`
         px-4 py-3 rounded-xl bg-white border-2 transition-all
-        shadow-md ${glowClass} hover:shadow-lg
+        shadow-md ${glowClass} hover:shadow-lg ring-2 ${clusterRing}
         min-w-[180px] max-w-[240px]
         ${data.mastered
           ? "border-green-400 bg-green-50"
@@ -66,6 +80,11 @@ function CustomNodeInner({ data }: { data: CustomNodeData }) {
             final
           </span>
         )}
+        {resourceCount > 0 && (
+          <span className="inline-block px-1.5 py-0.5 rounded text-[9px] font-medium bg-sky-50 text-sky-600 border border-sky-200">
+            {resourceCount} link{resourceCount > 1 ? "s" : ""}
+          </span>
+        )}
       </div>
 
       {/* Quick prereq hint (only on non-root nodes) */}
@@ -81,4 +100,3 @@ function CustomNodeInner({ data }: { data: CustomNodeData }) {
 }
 
 export const CustomNode = memo(CustomNodeInner);
-

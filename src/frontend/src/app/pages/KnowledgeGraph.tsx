@@ -17,8 +17,10 @@ import "reactflow/dist/style.css";
 import {
   generateKnowledgeGraph,
   generateSubGraph,
+  masterTopic,
+  getShortestPath,
 } from "../utils/api";
-import type { LearningPath, SkillGraphData } from "../utils/api";
+import type { LearningPath, SkillGraphData, LearningResource, GraphStats, ShortestPathStep } from "../utils/api";
 
 import { Button } from "../components/ui/button";
 import {
@@ -48,6 +50,12 @@ import {
   Loader2,
   AlertTriangle,
   RefreshCw,
+  ExternalLink,
+  BarChart3,
+  BookOpen,
+  Lock,
+  Unlock,
+  Zap,
 } from "lucide-react";
 import { motion } from "motion/react";
 import {
@@ -89,6 +97,13 @@ export function KnowledgeGraph() {
   const [showSubGraph, setShowSubGraph] = useState(false);
   const [subGraphData, setSubGraphData] = useState<SkillGraphData | null>(null);
   const [subGraphLoading, setSubGraphLoading] = useState(false);
+
+  /* --- Shortest path dialog --- */
+  const [shortestPath, setShortestPath] = useState<ShortestPathStep[] | null>(null);
+  const [shortestPathLoading, setShortestPathLoading] = useState(false);
+
+  /* --- Mastery state (server-synced) --- */
+  const [masteredSet, setMasteredSet] = useState<Set<string>>(new Set());
 
   /* --- Fetch graph on mount / skill change --- */
   const fetchGraph = useCallback(async () => {
@@ -159,19 +174,41 @@ export function KnowledgeGraph() {
   }, [selectedPath, graphData, setNodes, setEdges]);
 
   /* --- Node interactions --- */
-  const toggleNodeCompletion = useCallback((nodeId: string) => {
-    setCompletedNodes((prev) => {
-      const next = new Set(prev);
-      if (next.has(nodeId)) {
+  /* --- Node interactions --- */
+  const toggleNodeCompletion = useCallback(async (nodeId: string) => {
+    if (!decodedSkill) return;
+
+    // If already mastered locally, just toggle the UI marker
+    if (completedNodes.has(nodeId)) {
+      setCompletedNodes((prev) => {
+        const next = new Set(prev);
         next.delete(nodeId);
-        toast.info("Progress updated", { description: "Topic marked as incomplete" });
+        return next;
+      });
+      toast.info("Progress updated", { description: "Topic marked as incomplete" });
+      return;
+    }
+
+    // Server-side mastery validation
+    try {
+      const res = await masterTopic(decodedSkill, nodeId);
+      if (res.success) {
+        setCompletedNodes((prev) => new Set([...prev, nodeId]));
+        setMasteredSet(new Set(res.mastered.map((m) => m.id)));
+        toast.success("Great progress!", { description: "Topic mastered — server verified" });
       } else {
-        next.add(nodeId);
-        toast.success("Great progress!", { description: "Topic marked as complete" });
+        toast.error("Prerequisites not met", { description: res.reason ?? "Complete prerequisites first" });
       }
-      return next;
-    });
-  }, []);
+    } catch {
+      // Fallback to local toggle if server unavailable
+      setCompletedNodes((prev) => {
+        const next = new Set(prev);
+        next.add(nodeId);
+        return next;
+      });
+      toast.success("Great progress!", { description: "Topic marked as complete (offline)" });
+    }
+  }, [decodedSkill, completedNodes]);
 
   const handleNodeClick = useCallback((_event: React.MouseEvent, node: Node) => {
     setSelectedNode(node);
@@ -194,6 +231,22 @@ export function KnowledgeGraph() {
       setSubGraphLoading(false);
     }
   }, [selectedNode]);
+
+  /* --- Shortest path to a target node --- */
+  const findShortestPathTo = useCallback(async () => {
+    if (!selectedNode || !decodedSkill) return;
+    setShortestPathLoading(true);
+    setShortestPath(null);
+    try {
+      const path = await getShortestPath(decodedSkill, selectedNode.id);
+      setShortestPath(path);
+      toast.info("Shortest path found", { description: `${path.length} topics to reach ${selectedNode.data.label}` });
+    } catch (err: any) {
+      toast.error("Shortest path failed", { description: err?.message });
+    } finally {
+      setShortestPathLoading(false);
+    }
+  }, [selectedNode, decodedSkill]);
 
   /* --- Derived --- */
   const difficultyColor = useCallback((d: string) => {
@@ -242,7 +295,7 @@ export function KnowledgeGraph() {
   /* ── Sidebar content (shared between mobile sheet & desktop aside) ── */
   const sidebarContent = graphData ? (
     <Tabs defaultValue="paths" className="h-full">
-      <TabsList className="w-full grid grid-cols-2 rounded-none">
+      <TabsList className="w-full grid grid-cols-3 rounded-none">
         <TabsTrigger value="paths" className="gap-2">
           <Route className="size-4" />
           Paths
@@ -250,6 +303,10 @@ export function KnowledgeGraph() {
         <TabsTrigger value="progress" className="gap-2">
           <Target className="size-4" />
           Progress
+        </TabsTrigger>
+        <TabsTrigger value="stats" className="gap-2">
+          <BarChart3 className="size-4" />
+          Stats
         </TabsTrigger>
       </TabsList>
 
@@ -506,6 +563,120 @@ export function KnowledgeGraph() {
           />
         </div>
       </TabsContent>
+
+      {/* -- Stats tab -- */}
+      <TabsContent value="stats" className="p-4 space-y-3">
+        <div className="mb-4">
+          <h3 className="font-semibold mb-1 flex items-center gap-2">
+            <BarChart3 className="size-4 text-blue-600" />
+            Graph Analytics
+          </h3>
+          <p className="text-xs text-gray-500">
+            Spectral &amp; topological metrics measuring curriculum quality
+          </p>
+        </div>
+
+        {graphData.stats && (
+          <div className="space-y-2">
+            <div className="grid grid-cols-2 gap-2">
+              <div className="rounded-lg border p-3 bg-blue-50">
+                <p className="text-xs text-blue-600 font-medium">Topics</p>
+                <p className="text-xl font-bold text-blue-800">{graphData.stats.numTopics}</p>
+              </div>
+              <div className="rounded-lg border p-3 bg-purple-50">
+                <p className="text-xs text-purple-600 font-medium">Edges</p>
+                <p className="text-xl font-bold text-purple-800">{graphData.stats.numEdges}</p>
+              </div>
+            </div>
+
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm">Spectral Analysis</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-gray-600">Algebraic Connectivity (λ₂)</span>
+                  <span className="font-mono font-medium">
+                    {graphData.stats.algebraicConnectivity?.toFixed(4) ?? "N/A"}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-600">Spectral Gap (λ₂/λₘₐₓ)</span>
+                  <span className="font-mono font-medium">
+                    {graphData.stats.spectralGap?.toFixed(4) ?? "N/A"}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-600">Connected Components (β₀)</span>
+                  <span className="font-mono font-medium">
+                    {graphData.stats.connectedComponents ?? "N/A"}
+                  </span>
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm">Degree Distribution</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-gray-600">Avg In-Degree</span>
+                  <span className="font-mono font-medium">{graphData.stats.avgInDegree ?? "—"}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-600">Avg Out-Degree</span>
+                  <span className="font-mono font-medium">{graphData.stats.avgOutDegree ?? "—"}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-600">Max In-Degree</span>
+                  <span className="font-mono font-medium">{graphData.stats.maxInDegree ?? "—"}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-600">Max Out-Degree</span>
+                  <span className="font-mono font-medium">{graphData.stats.maxOutDegree ?? "—"}</span>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* ACO Convergence mini-chart */}
+            {(() => {
+              const acoPath = graphData.paths.find((p) => p.id === "path-aco");
+              const conv = acoPath?.convergence;
+              if (!conv || conv.length < 2) return null;
+              const maxVal = Math.max(...conv);
+              const minVal = Math.min(...conv);
+              const range = maxVal - minVal || 1;
+              const h = 60;
+              const w = 200;
+              const points = conv
+                .map((v, i) => `${(i / (conv.length - 1)) * w},${h - ((v - minVal) / range) * h}`)
+                .join(" ");
+              return (
+                <Card>
+                  <CardHeader className="pb-2">
+                    <CardTitle className="text-sm">ACO Convergence</CardTitle>
+                    <CardDescription className="text-xs">
+                      Cost: {conv[0].toFixed(1)} → {conv[conv.length - 1].toFixed(1)} over {conv.length} iterations
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent>
+                    <svg viewBox={`0 0 ${w} ${h}`} className="w-full h-16">
+                      <polyline
+                        points={points}
+                        fill="none"
+                        stroke="#8b5cf6"
+                        strokeWidth="2"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  </CardContent>
+                </Card>
+              );
+            })()}
+          </div>
+        )}
+      </TabsContent>
     </Tabs>
   ) : null;
 
@@ -668,9 +839,14 @@ export function KnowledgeGraph() {
       {/* ── Node Detail Dialog ─────────────────────────────────────── */}
       <Dialog
         open={!!selectedNode}
-        onOpenChange={(open) => !open && setSelectedNode(null)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setSelectedNode(null);
+            setShortestPath(null);
+          }
+        }}
       >
-        <DialogContent>
+        <DialogContent className="max-w-lg max-h-[80vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Play className="size-5 text-purple-600" />
@@ -733,11 +909,77 @@ export function KnowledgeGraph() {
               </div>
             )}
 
-            <div className="flex gap-2">
+            {/* Learning Resources */}
+            {((selectedNode?.data.resources as LearningResource[] | undefined) ?? []).length > 0 && (
+              <div>
+                <h4 className="font-medium mb-1.5 text-sm flex items-center gap-1.5">
+                  <BookOpen className="size-3.5 text-blue-500" />
+                  Learning Resources
+                </h4>
+                <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                  {(selectedNode!.data.resources as LearningResource[]).map((r, i) => (
+                    <a
+                      key={i}
+                      href={r.url || "#"}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-start gap-2 p-2 rounded-lg border hover:bg-blue-50 transition-colors group text-sm"
+                    >
+                      <ExternalLink className="size-3.5 text-blue-400 mt-0.5 flex-shrink-0 group-hover:text-blue-600" />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-gray-800 leading-tight truncate group-hover:text-blue-700">{r.title}</p>
+                        <div className="flex gap-1.5 mt-0.5">
+                          {r.source && (
+                            <span className="text-[9px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 border">
+                              {r.source}
+                            </span>
+                          )}
+                          {r.type && (
+                            <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-500 border border-blue-100">
+                              {r.type}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </a>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Shortest path result */}
+            {shortestPath && (
+              <div>
+                <h4 className="font-medium mb-1.5 text-sm flex items-center gap-1.5">
+                  <Zap className="size-3.5 text-amber-500" />
+                  Shortest Path ({shortestPath.length} topics)
+                </h4>
+                <div className="space-y-1 max-h-32 overflow-y-auto">
+                  {shortestPath.map((step, idx) => (
+                    <div key={step.id} className="flex items-center gap-2 text-xs">
+                      <span className="w-5 text-center font-medium text-gray-400">{idx + 1}</span>
+                      {step.mastered ? (
+                        <CheckCircle2 className="size-3.5 text-green-500 flex-shrink-0" />
+                      ) : (
+                        <Circle className="size-3.5 text-gray-300 flex-shrink-0" />
+                      )}
+                      <span className={step.mastered ? "line-through text-gray-400" : "text-gray-700"}>
+                        {step.name}
+                      </span>
+                      <Badge variant="outline" className="text-[8px] px-1 py-0 ml-auto">
+                        {step.level}
+                      </Badge>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="flex gap-2 flex-wrap">
               <Button
                 onClick={() => toggleNodeCompletion(selectedNode!.id)}
                 variant="outline"
-                className="flex-1"
+                className="flex-1 min-w-[120px]"
               >
                 {completedNodes.has(selectedNode?.id || "") ? (
                   <>
@@ -753,10 +995,23 @@ export function KnowledgeGraph() {
               </Button>
               <Button
                 onClick={openSubGraph}
-                className="flex-1 bg-purple-600 hover:bg-purple-700"
+                className="flex-1 min-w-[120px] bg-purple-600 hover:bg-purple-700"
               >
                 <Sparkles className="size-4 mr-2" />
-                Explore Sub-Skills
+                Sub-Skills
+              </Button>
+              <Button
+                onClick={findShortestPathTo}
+                variant="outline"
+                className="flex-1 min-w-[120px]"
+                disabled={shortestPathLoading}
+              >
+                {shortestPathLoading ? (
+                  <Loader2 className="size-4 mr-2 animate-spin" />
+                ) : (
+                  <Zap className="size-4 mr-2" />
+                )}
+                Shortest Path
               </Button>
             </div>
           </div>

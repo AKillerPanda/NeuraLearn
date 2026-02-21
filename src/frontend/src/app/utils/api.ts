@@ -1,8 +1,16 @@
 /**
- * NeuraLearn — API Client
- * =======================
+ * NeuraLearn — API Client  (full feature surface)
+ * =================================================
  * Replaces the old hardcoded graph templates with real calls
  * to the Flask backend (Webscraping → KnowledgeGraph → ACO).
+ *
+ * Surfaces ALL backend features:
+ *  - Knowledge graph + learning resources + spectral cluster labels
+ *  - Mastery tracking (prerequisite-validated)
+ *  - Shortest path to any target topic
+ *  - Graph analytics (spectral gap, connectivity, etc.)
+ *  - ACO convergence history
+ *  - SDS spell correction
  *
  * All functions return Promises.  The React components use
  * React state + useEffect to handle the async lifecycle.
@@ -13,6 +21,13 @@ import type { Node, Edge } from "reactflow";
 /*  Types                                                              */
 /* ------------------------------------------------------------------ */
 
+export interface LearningResource {
+  title: string;
+  url: string;
+  source: string;
+  type: string;
+}
+
 export interface LearningPath {
   id: string;
   name: string;
@@ -20,12 +35,26 @@ export interface LearningPath {
   duration: string;
   difficulty: "beginner" | "intermediate" | "advanced";
   nodeIds: string[];
+  convergence?: number[];
+}
+
+export interface GraphStats {
+  numTopics: number;
+  numEdges: number;
+  algebraicConnectivity: number | null;
+  spectralGap: number | null;
+  connectedComponents: number | null;
+  avgOutDegree?: number;
+  avgInDegree?: number;
+  maxOutDegree?: number;
+  maxInDegree?: number;
 }
 
 export interface SkillGraphData {
   nodes: Node[];
   edges: Edge[];
   paths: LearningPath[];
+  stats?: GraphStats;
 }
 
 export interface SpellSuggestion {
@@ -37,6 +66,20 @@ export interface SpellResult {
   original: string;
   suggestions: SpellSuggestion[];
   inDictionary: boolean;
+}
+
+export interface MasteryState {
+  mastered: { id: string; name: string }[];
+  available: { id: string; name: string }[];
+  locked: { id: string; name: string }[];
+  progress: number;
+}
+
+export interface ShortestPathStep {
+  id: string;
+  name: string;
+  mastered: boolean;
+  level: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -118,6 +161,7 @@ export async function generateKnowledgeGraph(
     nodes: Node[];
     edges: Edge[];
     paths: LearningPath[];
+    stats?: GraphStats;
   }>("/generate", { skill });
 
   return {
@@ -134,6 +178,7 @@ export async function generateKnowledgeGraph(
       },
     })),
     paths: raw.paths,
+    stats: raw.stats,
   };
 }
 
@@ -147,6 +192,7 @@ export async function generateSubGraph(
     nodes: Node[];
     edges: Edge[];
     paths: LearningPath[];
+    stats?: GraphStats;
   }>("/sub-graph", { topic });
 
   return {
@@ -163,6 +209,7 @@ export async function generateSubGraph(
       },
     })),
     paths: raw.paths,
+    stats: raw.stats,
   };
 }
 
@@ -178,4 +225,53 @@ export async function spellCheck(
     top_k: topK,
   });
   return res.results;
+}
+
+/**
+ * Mark a topic as mastered (server-side prerequisite validation).
+ */
+export async function masterTopic(
+  skill: string,
+  topicId: string,
+): Promise<MasteryState & { success: boolean; reason?: string }> {
+  return post("/master", { skill, topicId });
+}
+
+/**
+ * Get the shortest path (min topics) to reach a target topic.
+ */
+export async function getShortestPath(
+  skill: string,
+  targetId: string,
+): Promise<ShortestPathStep[]> {
+  const res = await post<{ path: ShortestPathStep[] }>("/shortest-path", {
+    skill,
+    targetId,
+  });
+  return res.path;
+}
+
+/**
+ * Fetch current mastery progress for a stored graph.
+ */
+export async function getProgress(skill: string): Promise<MasteryState> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${API_BASE}/progress/${encodeURIComponent(skill)}`, {
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error ?? `API ${res.status}`);
+    }
+    return res.json() as Promise<MasteryState>;
+  } catch (e: unknown) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error("Request timed out.");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }

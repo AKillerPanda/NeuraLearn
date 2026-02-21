@@ -149,6 +149,15 @@ class LearningPlan:
 					"name": step.subtopic,
 					"description": step.description,
 					"level": level,
+					"resources": [
+						{
+							"title": r.title,
+							"url": r.url,
+							"source": r.source,
+							"type": r.resource_type,
+						}
+						for r in step.resources
+					],
 				}
 
 				prereqs: list[str] = []
@@ -490,7 +499,7 @@ def get_learning_spec(topic: str) -> list[dict]:
 	Return a list-of-dicts spec that can be fed directly into
 	KnowledgeGraph.from_spec() or kg.rebuild_from_spec().
 
-	Each dict has: name, description, level, prerequisite_names (chained linearly).
+	Each dict has: name, description, level, prerequisite_names, resources.
 	"""
 	plan = get_learning_plan(topic)
 	return plan.to_dict_list()
