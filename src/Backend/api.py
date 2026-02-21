@@ -37,6 +37,7 @@ from Webscraping import get_learning_spec
 from graph import KnowledgeGraph, TopicLevel
 from ACO import LearningPathACO
 from SDS import spell_correct, correct_phrase, load_dictionary
+from difficulty_gnn import predict_difficulty, get_difficulty_explanation, get_smart_recommendation
 
 # ── App setup ───────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -282,11 +283,12 @@ def _build_learning_paths(
 
     # helper: build an ordered step list with context for a sequence of topic ids
     def _steps_with_context(topic_ids: list[int]) -> list[dict[str, str]]:
+        topic_ids_set = set(topic_ids)
         steps = []
         for idx, tid in enumerate(topic_ids):
             t = kg.topics[tid]
             prereq_names = sorted(kg.topics[p].name for p in t.prerequisites)
-            unlock_names = sorted(kg.topics[u].name for u in t.unlocks if u in {int(x) for x in [str(i) for i in topic_ids]})
+            unlock_names = sorted(kg.topics[u].name for u in t.unlocks if u in topic_ids_set)
             level_str = t.level.name.lower() if hasattr(t.level, "name") else str(t.level)
             steps.append({
                 "topicId":   str(tid),
@@ -377,7 +379,7 @@ def _build_learning_paths(
 # Analytics helper
 # ═══════════════════════════════════════════════════════════════════
 def _graph_stats(kg: KnowledgeGraph) -> dict[str, Any]:
-    """Compute spectral / topological analytics for the graph."""
+    """Compute spectral / topological analytics + plain-English learning insights."""
     stats: dict[str, Any] = {
         "numTopics": kg.num_topics,
         "numEdges":  int(kg.build_edge_index().size(1)),
@@ -404,6 +406,84 @@ def _graph_stats(kg: KnowledgeGraph) -> dict[str, Any]:
         stats["maxInDegree"]  = int(in_d[ids].max())
     except Exception:
         pass
+
+    # ── Learning Insights (plain-English reframing) ─────────────────
+    insights: dict[str, Any] = {}
+
+    # Curriculum Cohesion (from λ₂)
+    lam2 = stats.get("algebraicConnectivity")
+    if lam2 is not None:
+        if lam2 >= 1.0:
+            cohesion = "Strong"
+            cohesion_desc = "Topics are tightly interconnected — the curriculum flows naturally."
+        elif lam2 >= 0.3:
+            cohesion = "Moderate"
+            cohesion_desc = "The curriculum has reasonable connectivity with some independent branches."
+        elif lam2 > 0.0:
+            cohesion = "Weak"
+            cohesion_desc = "Topics are loosely connected — consider studying related areas to bridge gaps."
+        else:
+            cohesion = "Disconnected"
+            cohesion_desc = "Some topic groups are completely separate — you may need to study them independently."
+        insights["curriculumCohesion"] = {"rating": cohesion, "description": cohesion_desc, "value": lam2}
+
+    # Bottleneck Risk (from spectral gap + degree analysis)
+    gap = stats.get("spectralGap")
+    max_in = stats.get("maxInDegree", 0)
+    avg_in = stats.get("avgInDegree", 0)
+    if gap is not None:
+        # Find chokepoint topics (high in-degree relative to average)
+        chokepoints = []
+        if avg_in and max_in:
+            for tid, t in kg.topics.items():
+                if len(t.prerequisites) >= max(max_in * 0.7, avg_in * 2, 3):
+                    chokepoints.append(t.name)
+        if chokepoints:
+            bottleneck = "High"
+            bottleneck_desc = f"{len(chokepoints)} topic(s) require many prerequisites: {', '.join(chokepoints[:3])}{'...' if len(chokepoints) > 3 else ''}. Plan extra time for these."
+        elif gap < 0.1:
+            bottleneck = "Moderate"
+            bottleneck_desc = "The curriculum has some bottleneck points. Some topics may feel harder to reach."
+        else:
+            bottleneck = "Low"
+            bottleneck_desc = "The learning graph is well-balanced — no major bottlenecks detected."
+        insights["bottleneckRisk"] = {"rating": bottleneck, "description": bottleneck_desc, "chokepoints": chokepoints[:5]}
+
+    # Prerequisite Load
+    avg_prereqs = stats.get("avgInDegree", 0)
+    max_prereqs = stats.get("maxInDegree", 0)
+    if avg_prereqs is not None:
+        if avg_prereqs <= 1.0:
+            load_rating = "Light"
+            load_desc = "Most topics have just 0-1 prerequisites — you can explore freely."
+        elif avg_prereqs <= 2.0:
+            load_rating = "Moderate"
+            load_desc = f"Topics average {avg_prereqs} prerequisites. Follow the suggested path order for best results."
+        else:
+            load_rating = "Heavy"
+            load_desc = f"Topics average {avg_prereqs} prerequisites (max {max_prereqs}). This curriculum is highly sequential — stick to the learning path."
+        insights["prerequisiteLoad"] = {"rating": load_rating, "description": load_desc}
+
+    # Breadth vs Depth
+    components = stats.get("connectedComponents", 1)
+    n_topics = stats.get("numTopics", 0)
+    n_edges = stats.get("numEdges", 0)
+    if n_topics > 0:
+        depth_vec = kg.topological_depth_vector()
+        max_depth = int(depth_vec[list(kg.topics.keys())].max()) if kg.topics else 0
+        ratio = max_depth / max(n_topics, 1)
+        if ratio > 0.5:
+            structure = "Deep"
+            structure_desc = f"This curriculum goes {max_depth} levels deep — expect to build knowledge layer by layer."
+        elif ratio > 0.2:
+            structure = "Balanced"
+            structure_desc = f"A balanced mix of depth ({max_depth} levels) and breadth across the topic graph."
+        else:
+            structure = "Broad"
+            structure_desc = f"This curriculum is wide with many parallel topics — great for exploring different areas."
+        insights["curriculumShape"] = {"type": structure, "description": structure_desc, "depth": max_depth}
+
+    stats["insights"] = insights
     return stats
 
 
@@ -796,20 +876,20 @@ def export_flashcards(skill: str):
             back_parts.append(f"Unlocks: {', '.join(unlock_names)}")
         if resources:
             links = [f"• {r.get('title', '')} ({r.get('source', '')})" for r in resources[:3]]
-            back_parts.append("Resources:\\n" + "\\n".join(links))
+            back_parts.append("Resources:\n" + "\n".join(links))
 
         cards.append({
             "front": front,
-            "back":  "\\n".join(back_parts) if back_parts else "No description available.",
+            "back":  "\n".join(back_parts) if back_parts else "No description available.",
             "tags":  f"neuralearn {skill} {level_str}",
         })
 
     # Also build TSV for direct Anki import
-    tsv_lines = [f"{c['front']}\\t{c['back']}\\t{c['tags']}" for c in cards]
+    tsv_lines = [f"{c['front']}\t{c['back']}\t{c['tags']}" for c in cards]
 
     return jsonify({
         "cards": cards,
-        "tsv":   "\\n".join(tsv_lines),
+        "tsv":   "\n".join(tsv_lines),
         "count": len(cards),
     })
 
@@ -849,6 +929,56 @@ def study_stats(skill: str):
         "topicCount":       kg.num_topics,
         "masteredCount":    len(kg.get_mastered()),
     })
+
+
+@app.route("/api/difficulty/<skill>", methods=["GET"])
+def difficulty_analysis(skill: str):
+    """
+    GAT-based difficulty prediction for every topic in a stored graph.
+
+    Query params:
+      ?mastered=0,1,3  — comma-separated topic IDs already mastered (temporal context)
+
+    Response JSON: {
+      "scores":        { "0": 0.23, "1": 0.67, ... },
+      "explanations":  { "0": "...", "1": "...", ... },
+      "recommendation": [ { topicId, name, difficulty, reason }, ... ]
+    }
+    """
+    entry = _get_graph(skill.lower())
+    if not entry:
+        return jsonify({"error": f"no graph stored for '{skill}'"}), 404
+
+    kg, _ = entry
+
+    # Parse mastered IDs from query string
+    mastered_str = request.args.get("mastered", "")
+    mastered_ids: set[int] = set()
+    if mastered_str:
+        for part in mastered_str.split(","):
+            part = part.strip()
+            if part.isdigit():
+                mastered_ids.add(int(part))
+
+    try:
+        scores = predict_difficulty(kg, mastered_ids, skill_key=skill.lower())
+        explanations = {
+            str(tid): get_difficulty_explanation(kg, tid, score)
+            for tid, score in scores.items()
+        }
+        recommendation = get_smart_recommendation(
+            kg, mastered_ids, skill_key=skill.lower(),
+            precomputed_scores=scores,
+        )
+
+        return jsonify({
+            "scores": {str(k): v for k, v in scores.items()},
+            "explanations": explanations,
+            "recommendation": recommendation,
+        })
+    except Exception as exc:
+        log.error("difficulty analysis failed: %s\n%s", exc, traceback.format_exc())
+        return jsonify({"error": str(exc)}), 500
 
 
 # ═══════════════════════════════════════════════════════════════════

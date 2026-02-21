@@ -740,7 +740,7 @@ def test_sds():
     def t_sds_basic():
         ss = "try to find sds in this sentence"
         pos, activity = stochastic_diffusion_search(
-            ss, "sds", n_agents=30, max_iter=50, verbose=False, seed=42,
+            ss, "sds", n_agents=15, max_iter=20, verbose=False, seed=42,
         )
         assert pos >= 0, "should find 'sds'"
         assert ss[pos:pos + 3] == "sds"
@@ -751,7 +751,7 @@ def test_sds():
     def t_sds_start():
         ss = "hello world this is a test"
         pos, _ = stochastic_diffusion_search(
-            ss, "hello", n_agents=30, max_iter=80, verbose=False, seed=42,
+            ss, "hello", n_agents=15, max_iter=20, verbose=False, seed=42,
         )
         assert pos == 0
     _test("SDS finds pattern at start of string", t_sds_start)
@@ -760,7 +760,7 @@ def test_sds():
     def t_sds_end():
         ss = "beginning middle test"
         pos, _ = stochastic_diffusion_search(
-            ss, "test", n_agents=30, max_iter=80, verbose=False, seed=42,
+            ss, "test", n_agents=15, max_iter=20, verbose=False, seed=42,
         )
         assert pos == len(ss) - 4, f"expected {len(ss)-4}, got {pos}"
     _test("SDS finds pattern at end of string", t_sds_end)
@@ -769,7 +769,7 @@ def test_sds():
     def t_sds_single_char():
         ss = "abcdefghijklmnop"
         pos, _ = stochastic_diffusion_search(
-            ss, "k", n_agents=20, max_iter=60, verbose=False, seed=42,
+            ss, "k", n_agents=10, max_iter=20, verbose=False, seed=42,
         )
         assert pos == 10
     _test("SDS finds single character", t_sds_single_char)
@@ -795,8 +795,8 @@ def test_sds():
     # ---- deterministic seed ----
     def t_sds_deterministic():
         ss = "the quick brown fox jumps over the lazy dog"
-        r1 = stochastic_diffusion_search(ss, "fox", n_agents=20, max_iter=40, verbose=False, seed=123)
-        r2 = stochastic_diffusion_search(ss, "fox", n_agents=20, max_iter=40, verbose=False, seed=123)
+        r1 = stochastic_diffusion_search(ss, "fox", n_agents=10, max_iter=20, verbose=False, seed=123)
+        r2 = stochastic_diffusion_search(ss, "fox", n_agents=10, max_iter=20, verbose=False, seed=123)
         assert r1[0] == r2[0], "same seed should give same result"
     _test("SDS deterministic with seed", t_sds_deterministic)
 
@@ -804,7 +804,7 @@ def test_sds():
     def t_sds_activity():
         ss = "aaa bbb aaa bbb aaa"
         _, activity = stochastic_diffusion_search(
-            ss, "aaa", n_agents=50, max_iter=100, verbose=False, seed=42,
+            ss, "aaa", n_agents=20, max_iter=30, verbose=False, seed=42,
         )
         assert activity >= 0.5, f"expected high activity, got {activity}"
     _test("SDS high activity for repeated patterns", t_sds_activity)
@@ -871,21 +871,21 @@ def test_sds():
 
     # ---- spell_correct finds 'guitar' for 'guittar' ----
     def t_spell_guitar():
-        results = spell_correct("guittar", top_k=5, seed=42)
+        results = spell_correct("guittar", top_k=5, n_agents=30, max_iter=15, seed=42)
         top_words = [w for w, _ in results]
         assert "guitar" in top_words, f"'guitar' not in {top_words}"
     _test("spell_correct 'guittar' → guitar", t_spell_guitar)
 
     # ---- spell_correct finds 'piano' for 'pianno' ----
     def t_spell_piano():
-        results = spell_correct("pianno", top_k=5, seed=42)
+        results = spell_correct("pianno", top_k=5, n_agents=30, max_iter=15, seed=42)
         top_words = [w for w, _ in results]
         assert "piano" in top_words, f"'piano' not in {top_words}"
     _test("spell_correct 'pianno' → piano", t_spell_piano)
 
     # ---- spell_correct finds 'science' for 'sciance' ----
     def t_spell_science():
-        results = spell_correct("sciance", top_k=5, seed=42)
+        results = spell_correct("sciance", top_k=5, n_agents=30, max_iter=15, seed=42)
         top_words = [w for w, _ in results]
         assert "science" in top_words, f"'science' not in {top_words}"
     _test("spell_correct 'sciance' → science", t_spell_science)
@@ -893,7 +893,7 @@ def test_sds():
     # ---- spell_correct with custom dictionary ----
     def t_spell_custom_dict():
         custom = ["apple", "application", "apply", "banana", "band"]
-        results = spell_correct("appple", top_k=3, dictionary=custom, seed=42)
+        results = spell_correct("appple", top_k=3, dictionary=custom, n_agents=30, max_iter=15, seed=42)
         top_words = [w for w, _ in results]
         assert len(top_words) > 0, "should return at least one suggestion"
         assert "apple" in top_words, f"'apple' not in {top_words}"
@@ -901,7 +901,7 @@ def test_sds():
 
     # ---- spell_correct returns (word, score) tuples ----
     def t_spell_format():
-        results = spell_correct("guittar", top_k=3, seed=42)
+        results = spell_correct("guittar", top_k=3, n_agents=30, max_iter=15, seed=42)
         assert isinstance(results, list)
         for item in results:
             assert isinstance(item, tuple)
@@ -921,7 +921,7 @@ def test_sds():
 
     # ---- correct_phrase: misspelled word gets suggestions ----
     def t_phrase_misspelled():
-        result = correct_phrase("guittar pianno", top_k=3)
+        result = correct_phrase("guittar pianno", top_k=3, n_agents=30, max_iter=15)
         assert len(result) == 2, f"expected 2 words, got {len(result)}"
         # Each should be a list of suggestions
         for suggestions in result:
@@ -931,7 +931,7 @@ def test_sds():
 
     # ---- correct_phrase: mixed known and unknown ----
     def t_phrase_mixed():
-        result = correct_phrase("the guittar", top_k=3)
+        result = correct_phrase("the guittar", top_k=3, n_agents=30, max_iter=15)
         assert len(result) == 2
         # "the" should pass through
         assert result[0] == [("the", 1.0)]
@@ -943,8 +943,8 @@ def test_sds():
 
     # ---- spell_correct deterministic with seed ----
     def t_spell_deterministic():
-        r1 = spell_correct("mathmatics", top_k=5, seed=99)
-        r2 = spell_correct("mathmatics", top_k=5, seed=99)
+        r1 = spell_correct("mathmatics", top_k=5, n_agents=30, max_iter=15, seed=99)
+        r2 = spell_correct("mathmatics", top_k=5, n_agents=30, max_iter=15, seed=99)
         assert r1 == r2, "same seed should give identical results"
     _test("spell_correct deterministic with seed", t_spell_deterministic)
 

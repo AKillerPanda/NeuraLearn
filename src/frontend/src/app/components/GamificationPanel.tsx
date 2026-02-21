@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState, useEffect, memo } from "react";
 import { motion } from "motion/react";
 import { Trophy, Star, Flame, Zap, Crown, Award, Rocket, Target } from "lucide-react";
 
@@ -112,7 +112,7 @@ const ACHIEVEMENTS: Achievement[] = [
 ];
 
 /* ── Component ────────────────────────────────────────────────── */
-export function GamificationPanel({
+export const GamificationPanel = memo(function GamificationPanel({
   topicsCompleted,
   totalTopics,
   pomodoroSessions,
@@ -123,39 +123,40 @@ export function GamificationPanel({
 }) {
   // Calculate XP from completed topics (estimate difficulty spread)
   const xp = useMemo(() => {
-    // Simple: 100 XP per topic + bonus per pomodoro
     return topicsCompleted * 100 + pomodoroSessions * 25;
   }, [topicsCompleted, pomodoroSessions]);
 
   const levelInfo = useMemo(() => levelFromXP(xp), [xp]);
 
-  // Streak: stored in localStorage
-  const streak = useMemo(() => {
-    try {
-      const data = JSON.parse(localStorage.getItem("neuralearn_streak") ?? "{}");
-      const today = new Date().toISOString().slice(0, 10);
-      if (data.lastDate === today) return data.count ?? 1;
-      // Check if yesterday
-      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-      if (data.lastDate === yesterday) {
-        const newCount = (data.count ?? 0) + 1;
-        localStorage.setItem("neuralearn_streak", JSON.stringify({ lastDate: today, count: newCount }));
-        return newCount;
+  // Read streak from StudyStreakCalendar's shared storage (no side effects)
+  const [streak, setStreak] = useState(0);
+  useEffect(() => {
+    function readStreak(): number {
+      try {
+        const raw = localStorage.getItem("neuralearn_study_streak");
+        if (!raw) return 0;
+        const data = JSON.parse(raw);
+        return data.currentStreak ?? 0;
+      } catch {
+        return 0;
       }
-      // Streak broken
-      if (topicsCompleted > 0 || pomodoroSessions > 0) {
-        localStorage.setItem("neuralearn_streak", JSON.stringify({ lastDate: today, count: 1 }));
-        return 1;
-      }
-      return 0;
-    } catch {
-      return 0;
     }
-  }, [topicsCompleted, pomodoroSessions]);
+    setStreak(readStreak());
+    const handler = () => setStreak(readStreak());
+    window.addEventListener("storage", handler);
+    window.addEventListener("neuralearn-streak-update", handler);
+    return () => {
+      window.removeEventListener("storage", handler);
+      window.removeEventListener("neuralearn-streak-update", handler);
+    };
+  }, []);
 
-  const stats: GamificationStats = { topicsCompleted, totalTopics, pomodoroSessions, xp, streak };
-  const earned = ACHIEVEMENTS.filter((a) => a.check(stats));
-  const locked = ACHIEVEMENTS.filter((a) => !a.check(stats));
+  const stats: GamificationStats = useMemo(
+    () => ({ topicsCompleted, totalTopics, pomodoroSessions, xp, streak }),
+    [topicsCompleted, totalTopics, pomodoroSessions, xp, streak],
+  );
+  const earned = useMemo(() => ACHIEVEMENTS.filter((a) => a.check(stats)), [stats]);
+  const locked = useMemo(() => ACHIEVEMENTS.filter((a) => !a.check(stats)), [stats]);
 
   return (
     <div className="space-y-4">
@@ -241,4 +242,4 @@ export function GamificationPanel({
       </div>
     </div>
   );
-}
+});

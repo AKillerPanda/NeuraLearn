@@ -1,13 +1,38 @@
+from __future__ import annotations
+
 import numpy as np
-import torch
-from torch_geometric.data import Data
-from torch_geometric.utils import degree
 from collections import deque
 from enum import Enum
 from dataclasses import dataclass, field
 from scipy import sparse as sp
 from scipy.sparse.linalg import eigsh, ArpackNoConvergence
 from scipy.sparse.csgraph import connected_components
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+    from torch_geometric.data import Data
+    from torch_geometric.utils import degree as _degree
+
+# ---------------------------------------------------------------------------
+# Lazy torch / torch_geometric imports  (saves ~5-6 s on first import)
+# ---------------------------------------------------------------------------
+_torch = None
+_tg_Data = None
+_tg_degree = None
+
+
+def _ensure_torch():
+    """Import torch + torch_geometric on first real use."""
+    global _torch, _tg_Data, _tg_degree
+    if _torch is None:
+        import torch as _t
+        from torch_geometric.data import Data as _D
+        from torch_geometric.utils import degree as _d
+        _torch = _t
+        _tg_Data = _D
+        _tg_degree = _d
+    return _torch
 
 """
 NeuraLearn Knowledge Graph  (optimised via spectral & topological graph theory)
@@ -77,7 +102,7 @@ class Topic:
 		self.name = name
 		self.description = description
 		self.level = level
-		self.features = features if features is not None else torch.zeros(1)
+		self.features = features           # None → lazy torch.zeros(1) in build_feature_matrix
 		self.mastered: bool = False
 		self.prerequisites: set[int] = set()   # topic_ids this depends on  (in-edges)
 		self.unlocks: set[int] = set()         # topic_ids this unlocks     (out-edges)
@@ -115,7 +140,7 @@ class KnowledgeGraph:
 	"""
 
 	__slots__ = (
-		"device", "topics", "_next_id",
+		"_device_raw", "topics", "_next_id",
 		"_name_index",
 		"_edge_index_cache", "_degree_cache", "_topo_cache",
 		"_laplacian_cache", "_spectral_cache",
@@ -125,7 +150,7 @@ class KnowledgeGraph:
 		self,
 		device: torch.device | str | None = None,
 	) -> None:
-		self.device = torch.device(device) if device is not None else torch.device("cpu")
+		self._device_raw = device           # resolved lazily via .device property
 		self.topics: dict[int, Topic] = {}
 		self._next_id: int = 0
 		self._name_index: dict[str, int] = {}          # lower(name) → topic_id
@@ -136,6 +161,16 @@ class KnowledgeGraph:
 		self._spectral_cache: dict[str, np.ndarray] = {}  # cached eigenvectors/values
 
 	# ---- helpers -----------------------------------------------------------
+	@property
+	def device(self) -> torch.device:
+		"""Lazily resolve to a torch.device (first access imports torch)."""
+		raw = self._device_raw
+		if raw is None or isinstance(raw, str):
+			_ensure_torch()
+			resolved = _torch.device(raw) if raw else _torch.device("cpu")
+			self._device_raw = resolved
+		return self._device_raw
+
 	@property
 	def num_topics(self) -> int:
 		return len(self.topics)
@@ -353,10 +388,11 @@ class KnowledgeGraph:
 		"""[2, E] tensor  (prerequisite → dependent).  Vectorised construction."""
 		if self._edge_index_cache is not None:
 			return self._edge_index_cache
+		_ensure_torch()
 		# Pre-allocate numpy arrays then zero-copy convert to torch
 		num_edges = sum(len(t.unlocks) for t in self.topics.values())
 		if num_edges == 0:
-			ei = torch.zeros((2, 0), dtype=torch.long, device=self.device)
+			ei = _torch.zeros((2, 0), dtype=_torch.long, device=self.device)
 			self._edge_index_cache = ei
 			return ei
 		src = np.empty(num_edges, dtype=np.int64)
@@ -368,22 +404,37 @@ class KnowledgeGraph:
 				src[pos:pos + k] = t.topic_id
 				dst[pos:pos + k] = list(t.unlocks)
 				pos += k
-		ei = torch.from_numpy(np.stack([src, dst])).to(device=self.device)
+		ei = _torch.from_numpy(np.stack([src, dst])).to(device=self.device)
 		self._edge_index_cache = ei
 		return ei
 
 	def build_feature_matrix(self) -> torch.Tensor:
 		"""(N, F) feature matrix, rows ordered by topic_id."""
-		ordered = [self.topics[tid].features for tid in sorted(self.topics)]
-		return torch.stack(ordered, dim=0).to(self.device)
+		_ensure_torch()
+		_z = _torch.zeros(1)
+		ordered = [
+			self.topics[tid].features if self.topics[tid].features is not None else _z
+			for tid in sorted(self.topics)
+		]
+		return _torch.stack(ordered, dim=0).to(self.device)
 
 	def build_adjacency_numpy(self) -> np.ndarray:
-		"""Dense adjacency matrix as numpy float32 array (for external consumers)."""
+		"""Dense adjacency matrix as numpy float32 array (for external consumers).
+		Vectorised: builds directly from topology — no torch dependency."""
 		n = max(self.topics) + 1 if self.topics else 0
 		adj = np.zeros((n, n), dtype=np.float32)
-		for t in self.topics.values():
-			if t.unlocks:
-				adj[t.topic_id, list(t.unlocks)] = 1.0
+		num_edges = sum(len(t.unlocks) for t in self.topics.values())
+		if num_edges > 0:
+			src = np.empty(num_edges, dtype=np.int64)
+			dst = np.empty(num_edges, dtype=np.int64)
+			pos = 0
+			for t in self.topics.values():
+				k = len(t.unlocks)
+				if k:
+					src[pos:pos + k] = t.topic_id
+					dst[pos:pos + k] = list(t.unlocks)
+					pos += k
+			adj[src, dst] = 1.0
 		return adj
 
 	def out_degree(self) -> torch.Tensor:
@@ -392,7 +443,7 @@ class KnowledgeGraph:
 			return cached
 		ei = self.build_edge_index()
 		n = max(self.topics) + 1 if self.topics else 0
-		out = degree(ei[0], num_nodes=n, dtype=torch.long)
+		out = _tg_degree(ei[0], num_nodes=n, dtype=_torch.long)
 		self._degree_cache["out"] = out
 		return out
 
@@ -402,20 +453,21 @@ class KnowledgeGraph:
 			return cached
 		ei = self.build_edge_index()
 		n = max(self.topics) + 1 if self.topics else 0
-		ind = degree(ei[1], num_nodes=n, dtype=torch.long)
+		ind = _tg_degree(ei[1], num_nodes=n, dtype=_torch.long)
 		self._degree_cache["in"] = ind
 		return ind
 
 	def build_sparse_adjacency(self) -> torch.Tensor:
 		ei = self.build_edge_index()
 		n = max(self.topics) + 1 if self.topics else 0
-		vals = torch.ones(ei.size(1), device=self.device)
-		return torch.sparse_coo_tensor(ei, vals, size=(n, n)).coalesce()
+		vals = _torch.ones(ei.size(1), device=self.device)
+		return _torch.sparse_coo_tensor(ei, vals, size=(n, n)).coalesce()
 
 	# ---- spectral graph theory ---------------------------------------------
 
 	def _scipy_adjacency(self) -> sp.csc_matrix:
-		"""Build scipy sparse adjacency (symmetrised for undirected Laplacian)."""
+		"""Build scipy sparse adjacency (symmetrised for undirected Laplacian).
+		Vectorised: builds directly from topology — no torch dependency."""
 		cached = self._laplacian_cache.get("adj")
 		if cached is not None:
 			return cached
@@ -424,17 +476,27 @@ class KnowledgeGraph:
 			m = sp.csc_matrix((0, 0), dtype=np.float64)
 			self._laplacian_cache["adj"] = m
 			return m
-		rows, cols = [], []
+		# Build edge arrays directly from graph topology (pure numpy)
+		num_edges = sum(len(t.unlocks) for t in self.topics.values())
+		if num_edges == 0:
+			A = sp.csc_matrix((n, n), dtype=np.float64)
+			self._laplacian_cache["adj"] = A
+			return A
+		src = np.empty(num_edges, dtype=np.int64)
+		dst = np.empty(num_edges, dtype=np.int64)
+		pos = 0
 		for t in self.topics.values():
-			for u in t.unlocks:
-				rows.append(t.topic_id)
-				cols.append(u)
-				# symmetrise (treat DAG as undirected for spectral analysis)
-				rows.append(u)
-				cols.append(t.topic_id)
-		data = np.ones(len(rows), dtype=np.float64)
+			k = len(t.unlocks)
+			if k:
+				src[pos:pos + k] = t.topic_id
+				dst[pos:pos + k] = list(t.unlocks)
+				pos += k
+		# Symmetrise: stack forward + reverse edges
+		rows = np.concatenate([src, dst])
+		cols = np.concatenate([dst, src])
+		data = np.ones(rows.shape[0], dtype=np.float64)
 		A = sp.csc_matrix((data, (rows, cols)), shape=(n, n), dtype=np.float64)
-		# remove duplicates by clamping to 1 (sparse-only, no dense matrix)
+		# clamp duplicates to 1 (sparse-only, no dense matrix)
 		A.data[:] = np.minimum(A.data, 1.0)
 		A.setdiag(0)
 		A.eliminate_zeros()
@@ -715,8 +777,10 @@ class KnowledgeGraph:
 		Vectorised longest-path depth for every node via NumPy BFS.
 
 		Returns (N,) int32 array where depth[i] = length of the longest
-		path from any root (zero in-degree) to node i.  This is computed
-		as part of the Kahn's algorithm using vectorised in-degree updates.
+		path from any root (zero in-degree) to node i.
+
+		Vectorised: in-degree computed from edge_index via np.add.at;
+		per-level frontier updates use boolean masks instead of deque.
 		"""
 		cache_key = "topo_depth"
 		cached = self._spectral_cache.get(cache_key)
@@ -727,26 +791,40 @@ class KnowledgeGraph:
 			d = np.array([], dtype=np.int32)
 			self._spectral_cache[cache_key] = d
 			return d
-		# build adjacency as numpy arrays of src->dst
+		# Vectorised in-degree from topology (no torch dependency)
+		num_edges = sum(len(t.unlocks) for t in self.topics.values())
 		depth = np.zeros(n, dtype=np.int32)
 		in_deg = np.zeros(n, dtype=np.int32)
-		for t in self.topics.values():
-			for u in t.unlocks:
-				in_deg[u] += 1
-		queue = deque()
-		for tid in self.topics:
-			if in_deg[tid] == 0:
-				queue.append(tid)
-				depth[tid] = 0
-		while queue:
-			tid = queue.popleft()
-			for u in self.topics[tid].unlocks:
-				new_d = depth[tid] + 1
-				if new_d > depth[u]:
-					depth[u] = new_d
-				in_deg[u] -= 1
-				if in_deg[u] == 0:
-					queue.append(u)
+		if num_edges > 0:
+			src = np.empty(num_edges, dtype=np.int64)
+			dst = np.empty(num_edges, dtype=np.int64)
+			pos = 0
+			for t in self.topics.values():
+				k = len(t.unlocks)
+				if k:
+					src[pos:pos + k] = t.topic_id
+					dst[pos:pos + k] = list(t.unlocks)
+					pos += k
+			np.add.at(in_deg, dst, 1)
+		else:
+			src = dst = np.empty(0, dtype=np.int64)
+		# Frontier-based BFS (Kahn's) with vectorised updates
+		topic_ids = np.array(list(self.topics.keys()), dtype=np.int64)
+		frontier = topic_ids[in_deg[topic_ids] == 0]
+		while frontier.size > 0:
+			# Find all edges from frontier nodes
+			if src.size > 0:
+				mask = np.isin(src, frontier)
+				children = dst[mask]
+				parents = src[mask]
+				if children.size > 0:
+					# Vectorised max-depth propagation
+					new_depths = depth[parents] + 1
+					np.maximum.at(depth, children, new_depths)
+					in_deg[children] -= 1
+				frontier = np.unique(children[in_deg[children] == 0])
+			else:
+				break
 		self._spectral_cache[cache_key] = depth
 		return depth
 
@@ -754,7 +832,7 @@ class KnowledgeGraph:
 		ei = self.build_edge_index()
 		x = self.build_feature_matrix()
 		n = max(self.topics) + 1 if self.topics else 0
-		return Data(edge_index=ei, x=x, num_nodes=n)
+		return _tg_Data(edge_index=ei, x=x, num_nodes=n)
 
 	# ---- spec-based (re)build ---------------------------------------------
 	@classmethod

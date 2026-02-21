@@ -48,6 +48,7 @@ export interface GraphStats {
   avgInDegree?: number;
   maxOutDegree?: number;
   maxInDegree?: number;
+  insights?: LearningInsights;
 }
 
 export interface SkillGraphData {
@@ -103,6 +104,48 @@ export interface StudyStats {
   byLevel: Record<string, number>;
   topicCount: number;
   masteredCount: number;
+}
+
+/* ── Learning Insights types ─────────────────────────────────────── */
+export interface InsightRating {
+  rating: string;
+  description: string;
+  value?: number;
+}
+
+export interface BottleneckInsight {
+  rating: string;
+  description: string;
+  chokepoints?: string[];
+}
+
+export interface CurriculumShapeInsight {
+  type: string;
+  description: string;
+  depth: number;
+}
+
+export interface LearningInsights {
+  curriculumCohesion?: InsightRating;
+  bottleneckRisk?: BottleneckInsight;
+  prerequisiteLoad?: InsightRating;
+  curriculumShape?: CurriculumShapeInsight;
+}
+
+/* ── Difficulty Analysis types ───────────────────────────────────── */
+export interface DifficultyScores {
+  scores: Record<string, number>;
+  explanations: Record<string, string>;
+  recommendation: DifficultyRecommendation[];
+}
+
+export interface DifficultyRecommendation {
+  topicId: string;
+  name: string;
+  difficulty: number;
+  level: string;
+  reason: string;
+  unlockCount: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -349,6 +392,39 @@ export async function getStudyStats(skill: string): Promise<StudyStats> {
       throw new Error(err.error ?? `API ${res.status}`);
     }
     return res.json() as Promise<StudyStats>;
+  } catch (e: unknown) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error("Request timed out.");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Get GAT-based difficulty analysis for a stored graph.
+ * Includes per-topic scores, explanations, and smart recommendations.
+ */
+export async function getDifficulty(
+  skill: string,
+  masteredIds: string[] = [],
+): Promise<DifficultyScores> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const params = masteredIds.length > 0
+      ? `?mastered=${masteredIds.join(",")}`
+      : "";
+    const res = await fetch(
+      `${API_BASE}/difficulty/${encodeURIComponent(skill)}${params}`,
+      { signal: controller.signal },
+    );
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error ?? `API ${res.status}`);
+    }
+    return res.json() as Promise<DifficultyScores>;
   } catch (e: unknown) {
     if (e instanceof DOMException && e.name === "AbortError") {
       throw new Error("Request timed out.");

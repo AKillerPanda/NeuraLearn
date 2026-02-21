@@ -21,8 +21,9 @@ import {
   getProgress,
   exportFlashcards,
   getStudyStats,
+  getDifficulty,
 } from "../utils/api";
-import type { LearningPath, SkillGraphData, LearningResource, GraphStats, ShortestPathStep, StudyStats } from "../utils/api";
+import type { LearningPath, SkillGraphData, LearningResource, ShortestPathStep, StudyStats, DifficultyScores } from "../utils/api";
 
 import { Button } from "../components/ui/button";
 import {
@@ -75,6 +76,11 @@ import { Toaster } from "../components/ui/sonner";
 import { CustomNode } from "../components/CustomNode";
 import { PomodoroTimer } from "../components/PomodoroTimer";
 import { GamificationPanel } from "../components/GamificationPanel";
+import { StudyStreakCalendar } from "../components/StudyStreakCalendar";
+import { TopicNotes, NotesSummary } from "../components/TopicNotes";
+import { WeeklyStudyGoal } from "../components/WeeklyStudyGoal";
+import { SmartRecommendation } from "../components/SmartRecommendation";
+import { LearningInsightsPanel } from "../components/LearningInsightsPanel";
 
 /* ── Constants (stable ref — defined outside component to avoid re-renders) ── */
 const nodeTypes = { custom: CustomNode } as const;
@@ -112,6 +118,7 @@ export function KnowledgeGraph() {
   const [pomodoroSessions, setPomodoroSessions] = useState(0);
   const [darkMode, setDarkMode] = useState(false);
   const [studyStats, setStudyStats] = useState<StudyStats | null>(null);
+  const [difficultyData, setDifficultyData] = useState<DifficultyScores | null>(null);
 
   /* --- Fetch graph on mount / skill change --- */
   const fetchGraph = useCallback(async () => {
@@ -151,14 +158,23 @@ export function KnowledgeGraph() {
     fetchGraph();
   }, [fetchGraph]);
 
-  /* --- Highlight selected path --- */
+  /* --- Highlight selected path + inject difficulty scores --- */
   useEffect(() => {
     if (!graphData) return;
+
+    // Helper: inject difficulty score into node data
+    const withDifficulty = (node: Node): Node => {
+      const score = difficultyData?.scores[node.id];
+      if (score !== undefined) {
+        return { ...node, data: { ...node.data, difficultyScore: score } };
+      }
+      return node;
+    };
 
     if (selectedPath) {
       const pathSet = new Set(selectedPath.nodeIds);
       setNodes(
-        graphData.nodes.map((node) => ({
+        graphData.nodes.map((node) => withDifficulty({
           ...node,
           style: {
             ...node.style,
@@ -180,10 +196,10 @@ export function KnowledgeGraph() {
         })),
       );
     } else {
-      setNodes(graphData.nodes);
+      setNodes(graphData.nodes.map(withDifficulty));
       setEdges(graphData.edges);
     }
-  }, [selectedPath, graphData, setNodes, setEdges]);
+  }, [selectedPath, graphData, difficultyData, setNodes, setEdges]);
 
   /* --- Node interactions --- */
   const toggleNodeCompletion = useCallback(async (nodeId: string) => {
@@ -215,6 +231,9 @@ export function KnowledgeGraph() {
       if (res.success) {
         setCompletedNodes(new Set(res.mastered.map((m) => m.id)));
         toast.success("Great progress!", { description: "Topic mastered — server verified" });
+        // Log study activity for streak and weekly goal
+        (window as unknown as Record<string, unknown>).__logStudyActivity?.();
+        (window as unknown as Record<string, unknown>).__incrementWeeklyGoal?.();
       } else {
         toast.error("Prerequisites not met", { description: res.reason ?? "Complete prerequisites first" });
       }
@@ -288,6 +307,11 @@ export function KnowledgeGraph() {
     }
   }, [decodedSkill]);
 
+  /* --- Memoised callbacks for child components --- */
+  const handlePomodoroComplete = useCallback(() => {
+    setPomodoroSessions((n) => n + 1);
+  }, []);
+
   /* --- Fetch study stats --- */
   const fetchStudyStats = useCallback(async () => {
     if (!decodedSkill) return;
@@ -299,9 +323,24 @@ export function KnowledgeGraph() {
     }
   }, [decodedSkill]);
 
+  /* --- Fetch difficulty analysis --- */
+  const fetchDifficulty = useCallback(async () => {
+    if (!decodedSkill) return;
+    try {
+      const masteredArr = Array.from(completedNodes);
+      const data = await getDifficulty(decodedSkill, masteredArr);
+      setDifficultyData(data);
+    } catch {
+      // Not critical — difficulty analysis is optional
+    }
+  }, [decodedSkill, completedNodes]);
+
   useEffect(() => {
-    if (loadState === "done") fetchStudyStats();
-  }, [loadState, fetchStudyStats, completedNodes]);
+    if (loadState === "done") {
+      fetchStudyStats();
+      fetchDifficulty();
+    }
+  }, [loadState, fetchStudyStats, fetchDifficulty]);
 
   /* --- Derived --- */
   const difficultyColor = useCallback((d: string) => {
@@ -361,7 +400,7 @@ export function KnowledgeGraph() {
         </TabsTrigger>
         <TabsTrigger value="stats" className="gap-1 text-[11px] px-1">
           <BarChart3 className="size-3.5" />
-          Stats
+          Insights
         </TabsTrigger>
         <TabsTrigger value="timer" className="gap-1 text-[11px] px-1">
           <Timer className="size-3.5" />
@@ -627,82 +666,67 @@ export function KnowledgeGraph() {
         </div>
       </TabsContent>
 
-      {/* -- Stats tab -- */}
+      {/* -- Stats tab (reframed as Learning Insights) -- */}
       <TabsContent value="stats" className="p-4 space-y-3">
         <div className="mb-4">
           <h3 className="font-semibold mb-1 flex items-center gap-2">
             <BarChart3 className="size-4 text-blue-600" />
-            Graph Analytics
+            Learning Insights
           </h3>
           <p className="text-xs text-gray-500">
-            Spectral &amp; topological metrics measuring curriculum quality
+            AI-powered analysis of your curriculum and learning progress
           </p>
         </div>
 
+        {/* Study Streak Calendar */}
+        <Card>
+          <CardContent className="pt-4 pb-3">
+            <StudyStreakCalendar />
+          </CardContent>
+        </Card>
+
+        {/* Weekly Study Goal */}
+        <Card>
+          <CardContent className="pt-4 pb-3">
+            <WeeklyStudyGoal />
+          </CardContent>
+        </Card>
+
+        {/* Smart Recommendation */}
+        {difficultyData && difficultyData.recommendation.length > 0 && (
+          <Card>
+            <CardContent className="pt-4 pb-3">
+              <SmartRecommendation
+                recommendations={difficultyData.recommendation}
+                onSelect={(topicId) => {
+                  const n = nodeMap.get(topicId);
+                  if (n) setSelectedNode(n);
+                }}
+              />
+            </CardContent>
+          </Card>
+        )}
+
         {graphData.stats && (
           <div className="space-y-2">
+            {/* Topic / Edge counts */}
             <div className="grid grid-cols-2 gap-2">
               <div className="rounded-lg border p-3 bg-blue-50">
                 <p className="text-xs text-blue-600 font-medium">Topics</p>
                 <p className="text-xl font-bold text-blue-800">{graphData.stats.numTopics}</p>
               </div>
               <div className="rounded-lg border p-3 bg-purple-50">
-                <p className="text-xs text-purple-600 font-medium">Edges</p>
+                <p className="text-xs text-purple-600 font-medium">Connections</p>
                 <p className="text-xl font-bold text-purple-800">{graphData.stats.numEdges}</p>
               </div>
             </div>
 
-            <Card>
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm">Spectral Analysis</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-gray-600">Algebraic Connectivity (λ₂)</span>
-                  <span className="font-mono font-medium">
-                    {graphData.stats.algebraicConnectivity?.toFixed(4) ?? "N/A"}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-600">Spectral Gap (λ₂/λₘₐₓ)</span>
-                  <span className="font-mono font-medium">
-                    {graphData.stats.spectralGap?.toFixed(4) ?? "N/A"}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-600">Connected Components (β₀)</span>
-                  <span className="font-mono font-medium">
-                    {graphData.stats.connectedComponents ?? "N/A"}
-                  </span>
-                </div>
-              </CardContent>
-            </Card>
+            {/* Learning Insights (plain English) */}
+            {graphData.stats.insights && (
+              <LearningInsightsPanel insights={graphData.stats.insights} />
+            )}
 
-            <Card>
-              <CardHeader className="pb-2">
-                <CardTitle className="text-sm">Degree Distribution</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-gray-600">Avg In-Degree</span>
-                  <span className="font-mono font-medium">{graphData.stats.avgInDegree ?? "—"}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-600">Avg Out-Degree</span>
-                  <span className="font-mono font-medium">{graphData.stats.avgOutDegree ?? "—"}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-600">Max In-Degree</span>
-                  <span className="font-mono font-medium">{graphData.stats.maxInDegree ?? "—"}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-600">Max Out-Degree</span>
-                  <span className="font-mono font-medium">{graphData.stats.maxOutDegree ?? "—"}</span>
-                </div>
-              </CardContent>
-            </Card>
-
-            {/* ACO Convergence mini-chart */}
+            {/* ACO Path Confidence */}
             {(() => {
               const acoPath = graphData.paths.find((p) => p.id === "path-aco");
               const conv = acoPath?.convergence;
@@ -710,6 +734,8 @@ export function KnowledgeGraph() {
               const maxVal = Math.max(...conv);
               const minVal = Math.min(...conv);
               const range = maxVal - minVal || 1;
+              const improvement = ((conv[0] - conv[conv.length - 1]) / Math.max(conv[0], 1)) * 100;
+              const confidence = improvement > 30 ? "High" : improvement > 10 ? "Medium" : "Low";
               const h = 60;
               const w = 200;
               const points = conv
@@ -718,9 +744,9 @@ export function KnowledgeGraph() {
               return (
                 <Card>
                   <CardHeader className="pb-2">
-                    <CardTitle className="text-sm">ACO Convergence</CardTitle>
+                    <CardTitle className="text-sm">Path Confidence</CardTitle>
                     <CardDescription className="text-xs">
-                      Cost: {conv[0].toFixed(1)} → {conv[conv.length - 1].toFixed(1)} over {conv.length} iterations
+                      {confidence} confidence — the AI optimiser improved the path by {improvement.toFixed(0)}%
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
@@ -767,6 +793,19 @@ export function KnowledgeGraph() {
           </Card>
         )}
 
+        {/* Notes Summary */}
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm flex items-center gap-1.5">
+              <BookOpen className="size-3.5 text-indigo-600" />
+              My Notes
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <NotesSummary skill={decodedSkill} />
+          </CardContent>
+        </Card>
+
         {/* Flashcard Export */}
         <Button
           variant="outline"
@@ -791,7 +830,7 @@ export function KnowledgeGraph() {
           </p>
         </div>
         <PomodoroTimer
-          onSessionComplete={() => setPomodoroSessions((n) => n + 1)}
+          onSessionComplete={handlePomodoroComplete}
         />
 
         {/* Quick tips */}
@@ -878,7 +917,7 @@ export function KnowledgeGraph() {
                   <Menu className="size-4" />
                 </Button>
               </SheetTrigger>
-              <SheetContent side="left" className="w-80 p-0">
+              <SheetContent side="left" className="w-96 p-0">
                 {sidebarContent}
               </SheetContent>
             </Sheet>
@@ -925,7 +964,7 @@ export function KnowledgeGraph() {
       {/* ── Body ───────────────────────────────────────────────────── */}
       <div className="flex-1 flex overflow-hidden">
         {/* Desktop sidebar */}
-        <aside className={`w-80 border-r overflow-y-auto hidden lg:block ${darkMode ? "bg-gray-800 border-gray-700" : "bg-white"}`}>
+        <aside className={`w-96 border-r overflow-y-auto hidden lg:block ${darkMode ? "bg-gray-800 border-gray-700" : "bg-white"}`}>
           {sidebarContent}
         </aside>
 
@@ -980,7 +1019,11 @@ export function KnowledgeGraph() {
             >
               <Background />
               <Controls />
-              <MiniMap />
+              <MiniMap
+                style={{ width: 120, height: 90 }}
+                zoomable
+                pannable
+              />
               <Panel
                 position="top-right"
                 className="bg-white p-4 rounded-lg shadow-lg m-4 max-w-xs"
@@ -1014,7 +1057,7 @@ export function KnowledgeGraph() {
           }
         }}
       >
-        <DialogContent className="max-w-lg max-h-[80vh] overflow-y-auto">
+        <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Play className="size-5 text-purple-600" />
@@ -1084,7 +1127,7 @@ export function KnowledgeGraph() {
                   <BookOpen className="size-3.5 text-blue-500" />
                   Learning Resources
                 </h4>
-                <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                <div className="space-y-1.5 max-h-56 overflow-y-auto">
                   {(selectedNode!.data.resources as LearningResource[]).map((r, i) => (
                     <a
                       key={i}
@@ -1122,7 +1165,7 @@ export function KnowledgeGraph() {
                   <Zap className="size-3.5 text-amber-500" />
                   Shortest Path ({shortestPath.length} topics)
                 </h4>
-                <div className="space-y-1 max-h-32 overflow-y-auto">
+                <div className="space-y-1 max-h-44 overflow-y-auto">
                   {shortestPath.map((step, idx) => (
                     <div key={step.id} className="flex items-center gap-2 text-xs">
                       <span className="w-5 text-center font-medium text-gray-400">{idx + 1}</span>
@@ -1143,11 +1186,52 @@ export function KnowledgeGraph() {
               </div>
             )}
 
-            <div className="flex gap-2 flex-wrap">
+            {/* AI Difficulty Analysis */}
+            {selectedNode && difficultyData?.scores[selectedNode.id] !== undefined && (
+              <div className="rounded-lg border p-3 bg-gradient-to-r from-purple-50 to-blue-50">
+                <h4 className="font-medium mb-1.5 text-sm flex items-center gap-1.5">
+                  <Brain className="size-3.5 text-purple-600" />
+                  AI Difficulty Analysis
+                </h4>
+                <div className="flex items-center gap-2 mb-1.5">
+                  <div className="flex-1 h-2 bg-gray-200 rounded-full overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all ${
+                        difficultyData.scores[selectedNode.id] < 0.25 ? "bg-green-400" :
+                        difficultyData.scores[selectedNode.id] < 0.5 ? "bg-yellow-400" :
+                        difficultyData.scores[selectedNode.id] < 0.75 ? "bg-orange-400" :
+                        "bg-red-400"
+                      }`}
+                      style={{ width: `${difficultyData.scores[selectedNode.id] * 100}%` }}
+                    />
+                  </div>
+                  <span className="text-xs font-mono font-medium">
+                    {(difficultyData.scores[selectedNode.id] * 100).toFixed(0)}%
+                  </span>
+                </div>
+                {difficultyData.explanations[selectedNode.id] && (
+                  <p className="text-[11px] text-gray-600 leading-snug">
+                    {difficultyData.explanations[selectedNode.id]}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* Topic Notes */}
+            {selectedNode && (
+              <div className="border-t pt-3">
+                <TopicNotes
+                  topicId={selectedNode.id}
+                  topicName={selectedNode.data.label as string}
+                  skill={decodedSkill}
+                />
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
               <Button
                 onClick={() => toggleNodeCompletion(selectedNode!.id)}
                 variant="outline"
-                className="flex-1 min-w-[120px]"
               >
                 {completedNodes.has(selectedNode?.id || "") ? (
                   <>
@@ -1163,7 +1247,7 @@ export function KnowledgeGraph() {
               </Button>
               <Button
                 onClick={openSubGraph}
-                className="flex-1 min-w-[120px] bg-purple-600 hover:bg-purple-700"
+                className="bg-purple-600 hover:bg-purple-700"
               >
                 <Sparkles className="size-4 mr-2" />
                 Sub-Skills
@@ -1171,7 +1255,6 @@ export function KnowledgeGraph() {
               <Button
                 onClick={findShortestPathTo}
                 variant="outline"
-                className="flex-1 min-w-[120px]"
                 disabled={shortestPathLoading}
               >
                 {shortestPathLoading ? (
@@ -1188,7 +1271,7 @@ export function KnowledgeGraph() {
 
       {/* ── Sub-Graph Dialog ───────────────────────────────────────── */}
       <Dialog open={showSubGraph} onOpenChange={setShowSubGraph}>
-        <DialogContent className="max-w-4xl h-[600px] flex flex-col">
+        <DialogContent className="max-w-6xl h-[80vh] flex flex-col">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Brain className="size-5 text-purple-600" />

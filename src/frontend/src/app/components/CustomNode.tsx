@@ -11,6 +11,7 @@ interface CustomNodeData {
   depth?: number;
   cluster?: number;
   resources?: { title: string; url: string; source: string; type: string }[];
+  difficultyScore?: number; // GAT-predicted difficulty 0-1
 }
 
 const LEVEL_BADGE: Record<string, string> = {
@@ -92,6 +93,28 @@ function CustomNodeInner({ data }: { data: CustomNodeData }) {
         <p className="text-[9px] text-gray-400 mt-1 leading-tight truncate">
           needs: {prereqs.join(", ")}
         </p>
+      )}
+
+      {/* Difficulty heatmap bar */}
+      {data.difficultyScore !== undefined && (
+        <div className="mt-1.5 flex items-center gap-1">
+          <div className="flex-1 h-1 bg-gray-200 rounded-full overflow-hidden">
+            <div
+              className="h-full rounded-full transition-all"
+              style={{
+                width: `${data.difficultyScore * 100}%`,
+                backgroundColor:
+                  data.difficultyScore < 0.25 ? "#4ade80" :
+                  data.difficultyScore < 0.5 ? "#facc15" :
+                  data.difficultyScore < 0.75 ? "#fb923c" :
+                  "#f87171",
+              }}
+            />
+          </div>
+          <span className="text-[8px] text-gray-400 font-mono">
+            {(data.difficultyScore * 100).toFixed(0)}%
+          </span>
+        </div>
       )}
 
       <Handle type="source" position={Position.Bottom} className="w-3 h-3" />

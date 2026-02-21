@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, memo } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Play, Pause, RotateCcw, Coffee, Brain, Timer } from "lucide-react";
 import { Button } from "./ui/button";
@@ -37,21 +37,25 @@ const MODE_RING: Record<Mode, string> = {
   longBreak: "stroke-blue-500",
 };
 
+/* ── SVG constants (hoisted to module level) ───────────────────── */
+const SVG_RADIUS = 54;
+const SVG_CIRCUMFERENCE = 2 * Math.PI * SVG_RADIUS;
+
 /* ── Component ─────────────────────────────────────────────────── */
-export function PomodoroTimer({ onSessionComplete }: { onSessionComplete?: () => void }) {
+export const PomodoroTimer = memo(function PomodoroTimer({ onSessionComplete }: { onSessionComplete?: () => void }) {
   const [mode, setMode] = useState<Mode>("focus");
   const [secondsLeft, setSecondsLeft] = useState(PRESETS.focus);
   const [running, setRunning] = useState(false);
   const [sessions, setSessions] = useState(0);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const onCompleteRef = useRef(onSessionComplete);
+
+  // Keep ref in sync without restarting intervals
+  useEffect(() => { onCompleteRef.current = onSessionComplete; }, [onSessionComplete]);
 
   const totalSeconds = PRESETS[mode];
   const progress = 1 - secondsLeft / totalSeconds;
-
-  // SVG circle math
-  const radius = 54;
-  const circumference = 2 * Math.PI * radius;
-  const dashOffset = circumference * (1 - progress);
+  const dashOffset = SVG_CIRCUMFERENCE * (1 - progress);
 
   const reset = useCallback(() => {
     setRunning(false);
@@ -64,7 +68,7 @@ export function PomodoroTimer({ onSessionComplete }: { onSessionComplete?: () =>
     setSecondsLeft(PRESETS[newMode]);
   }, []);
 
-  // Tick
+  // Tick — uses functional updaters & refs to avoid stale closures
   useEffect(() => {
     if (!running) {
       if (intervalRef.current) clearInterval(intervalRef.current);
@@ -74,18 +78,19 @@ export function PomodoroTimer({ onSessionComplete }: { onSessionComplete?: () =>
       setSecondsLeft((prev) => {
         if (prev <= 1) {
           setRunning(false);
-          // Session complete
           if (mode === "focus") {
-            const newCount = sessions + 1;
-            setSessions(newCount);
-            onSessionComplete?.();
-            toast.success(`Focus session #${newCount} complete!`, {
-              description: newCount % 4 === 0 ? "Take a long break — you've earned it!" : "Time for a short break!",
+            setSessions((s) => {
+              const newCount = s + 1;
+              onCompleteRef.current?.();
+              toast.success(`Focus session #${newCount} complete!`, {
+                description: newCount % 4 === 0 ? "Take a long break — you've earned it!" : "Time for a short break!",
+              });
+              const nextMode = newCount % 4 === 0 ? "longBreak" : "shortBreak";
+              setMode(nextMode);
+              setSecondsLeft(PRESETS[nextMode]);
+              return newCount;
             });
-            // Auto-switch to break
-            const nextMode = newCount % 4 === 0 ? "longBreak" : "shortBreak";
-            setMode(nextMode);
-            return PRESETS[nextMode];
+            return prev; // will be overwritten by setSecondsLeft inside setSessions
           } else {
             toast.info("Break over!", { description: "Ready for another focus session?" });
             setMode("focus");
@@ -99,7 +104,7 @@ export function PomodoroTimer({ onSessionComplete }: { onSessionComplete?: () =>
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [running, mode, sessions, onSessionComplete]);
+  }, [running, mode]);
 
   const mm = String(Math.floor(secondsLeft / 60)).padStart(2, "0");
   const ss = String(secondsLeft % 60).padStart(2, "0");
@@ -129,19 +134,19 @@ export function PomodoroTimer({ onSessionComplete }: { onSessionComplete?: () =>
         <div className="relative w-32 h-32">
           <svg className="w-full h-full -rotate-90" viewBox="0 0 120 120">
             <circle
-              cx="60" cy="60" r={radius}
+              cx="60" cy="60" r={SVG_RADIUS}
               fill="none"
               stroke="currentColor"
               strokeWidth="6"
               className="text-gray-200"
             />
             <motion.circle
-              cx="60" cy="60" r={radius}
+              cx="60" cy="60" r={SVG_RADIUS}
               fill="none"
               strokeWidth="6"
               strokeLinecap="round"
               className={MODE_RING[mode]}
-              strokeDasharray={circumference}
+              strokeDasharray={SVG_CIRCUMFERENCE}
               strokeDashoffset={dashOffset}
               transition={{ duration: 0.5 }}
             />
@@ -202,4 +207,4 @@ export function PomodoroTimer({ onSessionComplete }: { onSessionComplete?: () =>
       </AnimatePresence>
     </div>
   );
-}
+});

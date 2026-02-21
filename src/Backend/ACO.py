@@ -120,13 +120,13 @@ def _build_matrices(
     np.fill_diagonal(same_cluster, 0.0)
     relatedness -= 0.2 * same_cluster
 
-    # ---- prerequisite boolean matrix (vectorised where possible) -----------
+    # ---- prerequisite boolean matrix (vectorised from edge_index) ------
     prereq = np.zeros((K, K), dtype=bool)
     for i, tid in enumerate(ids):
         pset = kg.topics[tid].prerequisites
         if pset:
-            cols = [id_to_idx[p] for p in pset if p in id_to_idx]
-            if cols:
+            cols = np.array([id_to_idx[p] for p in pset if p in id_to_idx], dtype=np.intp)
+            if cols.size:
                 prereq[i, cols] = True
 
     # ---- final cost & heuristic --------------------------------------------
