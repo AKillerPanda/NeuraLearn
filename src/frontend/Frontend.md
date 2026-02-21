@@ -1,0 +1,1 @@
+This is just the overall frontend ui- developed on figma as a base and then vibe coded a bit to make evrything since and neat.
