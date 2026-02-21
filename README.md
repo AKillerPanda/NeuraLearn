@@ -7,7 +7,7 @@ Type a topic. Get a complete curriculum. See how everything connects.
 ![Python](https://img.shields.io/badge/Python-3.14-blue)
 ![React](https://img.shields.io/badge/React-19-61DAFB)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6)
-![Tests](https://img.shields.io/badge/Tests-82%2F82-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-5_suites_(213_asserts)-brightgreen)
 
 ---
 
@@ -17,35 +17,57 @@ Type a topic. Get a complete curriculum. See how everything connects.
 2. **NeuraLearn scrapes the web** concurrently (Wikipedia, GeeksforGeeks, GitHub, DuckDuckGo) to discover subtopics and resources
 3. **Builds a knowledge graph** — a DAG where nodes are topics and edges are prerequisite relationships, with real fan-in/fan-out structure
 4. **Finds the best learning path** using Ant Colony Optimisation with spectral heuristics — not just any valid order, but the one that minimises cognitive load
-5. **Visualises everything** as an interactive graph you can explore, with multiple path options and progress tracking
+5. **Visualises everything** as an interactive graph you can explore, with multiple path options, progress tracking, gamification, and study tools
+
+---
+
+## Features
+
+### Core
+- **Knowledge Graph Generation** — webscrape → DAG → spectral layout → ACO-optimised paths, all in < 3 seconds
+- **Multiple Learning Paths** — prerequisite-respecting routes at beginner / intermediate / advanced difficulty
+- **Sub-Graph Deep Dives** — click any topic node to generate a detailed breakdown of that sub-skill
+- **Server-Side Mastery Tracking** — prerequisite-validated completion with cascade unmastering
+- **Shortest Path Finder** — find the minimum-topic route to reach any target node
+- **Live Spell Correction** — SDS-powered real-time spell-check as you type on the home page
+
+### University Student Features
+- **Pomodoro Timer** — 25/5/15-minute focus/break modes with SVG progress ring, auto-mode-switch, and session counter
+- **Gamification System** — XP (100 per topic, 25 per Pomodoro), quadratic levelling, 8 achievements, streak tracking
+- **Anki Flashcard Export** — one-click TSV download of all topics for spaced repetition
+- **Study Time Estimation** — per-topic minute estimates based on difficulty, with total/remaining hours
+- **Dark Mode** — full dark theme toggle across header, sidebar, graph, and toasts
+- **Graph Analytics Dashboard** — spectral gap, algebraic connectivity, ACO convergence chart, degree distribution
 
 ---
 
 ## How It Works — The Algorithms
 
-### Spectral Graph Theory (`graph.py`)
+### Spectral Graph Theory (`graph.py` — 903 lines)
 The knowledge graph isn't just a data structure — it's analysed using the **Laplacian spectrum** to understand its topology:
 - **Fiedler vector** (2nd eigenvector of the Laplacian) determines natural graph partitions and drives node layout
 - **Spectral embedding** maps topics into Euclidean space where distance = topological dissimilarity
 - **Algebraic connectivity** (λ₂) measures how tightly connected the curriculum is
 - **Spectral clustering** groups related topics without manual labelling
+- **ArpackNoConvergence resilience** — graceful fallback when eigensolvers partially converge
 
-### Ant Colony Optimisation (`ACO.py`)
+### Ant Colony Optimisation (`ACO.py` — 495 lines)
 Finding the optimal study order is NP-hard. ACO solves it with swarm intelligence:
 - 50 virtual ants walk the graph per iteration, guided by **pheromone trails** and a **spectral heuristic**
 - Pheromone is **warm-started using Fiedler distances** — spectrally close topics get higher initial pheromone, converging 2–5× faster
 - **Spectral distance** replaces naive edge-hop relatedness for the cost matrix
 - Prerequisite constraints are enforced via **vectorised boolean matrix multiplication**
 - All matrix ops (cost, heuristic, pheromone deposit) are **fully vectorised with NumPy**
+- **Early stopping** when convergence plateaus
 
-### Stochastic Diffusion Search (`SDS.py`)
+### Stochastic Diffusion Search (`SDS.py` — 557 lines)
 Real-time spell correction as you type, backed by a 100k+ word dictionary:
 - **Vectorised pre-filter** (character frequency + bigram overlap + prefix matching) narrows candidates from 100k → 200
 - **SDS agents** test random micro-features (fuzzy character position matching) and cluster on the best match
 - Final ranking combines SDS hits, character similarity, and **Levenshtein edit distance**
 - All operations on padded NumPy uint8 matrices — zero Python loops over the dictionary
 
-### Web Scraping (`Webscraping.py`)
+### Web Scraping (`Webscraping.py` — 524 lines)
 Structured curriculum extraction from multiple sources:
 - **Concurrent fetching** (4 sources in parallel via ThreadPoolExecutor)
 - **DAG-aware prerequisite assignment** — foundational topics have no prereqs, higher levels depend on 1–2 topics from the level below, creating realistic fan-in/fan-out
@@ -58,12 +80,12 @@ Structured curriculum extraction from multiple sources:
 neuralearn/
 ├── src/
 │   ├── Backend/
-│   │   ├── graph.py            # Knowledge graph + spectral analysis (Laplacian, Fiedler, clustering)
-│   │   ├── ACO.py              # Ant Colony Optimisation with spectral heuristics
-│   │   ├── SDS.py              # Stochastic Diffusion Search spell corrector
-│   │   ├── Webscraping.py      # Concurrent multi-source web scraper
-│   │   ├── api.py              # Flask REST API (spectral layout engine)
-│   │   ├── test_all.py         # 82 tests covering all modules
+│   │   ├── graph.py            # Knowledge graph + spectral analysis (903 lines)
+│   │   ├── ACO.py              # Ant Colony Optimisation with spectral heuristics (495 lines)
+│   │   ├── SDS.py              # Stochastic Diffusion Search spell corrector (557 lines)
+│   │   ├── Webscraping.py      # Concurrent multi-source web scraper (524 lines)
+│   │   ├── api.py              # Flask REST API — 10 endpoints, thread-safe (858 lines)
+│   │   ├── test_all.py         # 5 test suites, 213 assertions (1171 lines)
 │   │   └── words in english/   # A–Z dictionary CSVs for spell correction
 │   │
 │   └── frontend/
@@ -71,12 +93,14 @@ neuralearn/
 │       │   ├── app/
 │       │   │   ├── pages/
 │       │   │   │   ├── Home.tsx             # Landing page with live spell-check
-│       │   │   │   └── KnowledgeGraph.tsx   # Interactive graph + path explorer
+│       │   │   │   └── KnowledgeGraph.tsx   # Interactive graph + 5-tab sidebar
 │       │   │   ├── components/
-│       │   │   │   ├── CustomNode.tsx       # ReactFlow node with level badges
+│       │   │   │   ├── CustomNode.tsx       # ReactFlow node with level/cluster badges
+│       │   │   │   ├── PomodoroTimer.tsx    # 25/5/15-min study timer with SVG ring
+│       │   │   │   ├── GamificationPanel.tsx # XP, levels, achievements, streaks
 │       │   │   │   └── ui/                  # shadcn/ui component library
 │       │   │   ├── utils/
-│       │   │   │   └── api.ts               # Typed API client with timeout handling
+│       │   │   │   └── api.ts               # Typed API client (12 functions, timeout handling)
 │       │   │   ├── App.tsx
 │       │   │   └── routes.tsx
 │       │   └── main.tsx
@@ -95,10 +119,10 @@ neuralearn/
 
 | Layer | Tech |
 |-------|------|
-| **Graph Engine** | Python, NumPy, SciPy (sparse Laplacians, ARPACK eigensolver), PyTorch Geometric |
+| **Graph Engine** | Python 3.14, NumPy, SciPy (sparse Laplacians, ARPACK eigensolver), PyTorch Geometric |
 | **Optimisation** | Ant Colony Optimisation (vectorised), Stochastic Diffusion Search |
-| **API** | Flask, flask-cors |
-| **Frontend** | React 19, TypeScript, Vite, ReactFlow, Tailwind CSS v4, shadcn/ui, Motion |
+| **API** | Flask 3.1, flask-cors, thread-safe LRU graph store |
+| **Frontend** | React 19, TypeScript 5.7, Vite 6.4, ReactFlow, Tailwind CSS v4, shadcn/ui, Motion, Sonner |
 | **Scraping** | requests, BeautifulSoup4, MediaWiki API, concurrent.futures |
 
 ---
@@ -124,13 +148,15 @@ npm install
 npm run dev                     # → http://localhost:5173
 ```
 
+> **Note:** Always run `api.py` using the **venv Python** (`.venv\Scripts\python.exe api.py`) to ensure all dependencies are available.
+
 ---
 
 ## Run Tests
 
 ```bash
 cd src/Backend
-python test_all.py              # 82/82 tests
+python -m pytest test_all.py -v   # 5 suites, 213 assertions
 ```
 
 ---
@@ -140,9 +166,15 @@ python test_all.py              # 82/82 tests
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `POST` | `/api/generate` | Build knowledge graph + learning paths for a skill |
-| `POST` | `/api/spell-check` | SDS-powered spell correction |
 | `POST` | `/api/sub-graph` | Generate sub-graph for a subtopic |
-| `GET` | `/api/health` | Health check |
+| `POST` | `/api/spell-check` | SDS-powered spell correction |
+| `POST` | `/api/master` | Mark a topic as mastered (prerequisite-validated) |
+| `POST` | `/api/unmaster` | Un-master a topic with cascade to dependents |
+| `POST` | `/api/shortest-path` | Find minimum-topic route to a target node |
+| `GET`  | `/api/progress/:skill` | Get current mastery progress for a graph |
+| `GET`  | `/api/flashcards/:skill` | Export Anki-compatible flashcards (TSV) |
+| `GET`  | `/api/study-stats/:skill` | Study time estimates & difficulty breakdown |
+| `GET`  | `/api/health` | Health check |
 
 ---
 
