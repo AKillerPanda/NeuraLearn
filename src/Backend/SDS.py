@@ -250,20 +250,30 @@ def spell_correct(
 	cand_words = [words[i] for i in candidate_idx]
 	n_cand = len(cand_words)
 
-	# 1b. Character-frequency similarity (vectorised)
+	# 1b. Character-frequency similarity (fully vectorised via padded matrix)
 	#     Build a (n_cand, 26) letter-count matrix and compare to input
-	def _char_freq_vec(ws: list[str]) -> np.ndarray:
-		"""(W, 26) array of letter counts."""
-		mat = np.zeros((len(ws), 26), dtype=np.int8)
-		for i, w in enumerate(ws):
-			for ch in w:
-				c = ord(ch) - 97
-				if 0 <= c < 26:
-					mat[i, c] += 1
-		return mat
+	cand_max_len = max((len(w) for w in cand_words), default=1)
+	cand_padded = _pad_words(cand_words, cand_max_len)     # (n_cand, cand_max_len) uint8
+	# Vectorised char-freq: bin each row's characters into 26 buckets
+	# Shift ASCII a=97..z=122 to 0..25; chars outside get clipped out
+	def _vectorised_char_freq(padded_mat: np.ndarray) -> np.ndarray:
+		"""(W, L) uint8 -> (W, 26) int16 letter frequency matrix, fully vectorised."""
+		W, L = padded_mat.shape
+		shifted = padded_mat.astype(np.int16) - 97  # a=0, z=25
+		valid = (shifted >= 0) & (shifted < 26)
+		freq = np.zeros((W, 26), dtype=np.int16)
+		# Flatten and use np.add.at for vectorised bincount per row
+		row_idx = np.broadcast_to(np.arange(W)[:, None], (W, L)).ravel()
+		col_idx = np.clip(shifted, 0, 25).ravel()
+		mask = valid.ravel()
+		np.add.at(freq, (row_idx[mask], col_idx[mask]), 1)
+		return freq
 
-	cand_freq = _char_freq_vec(cand_words)                     # (n_cand, 26)
-	input_freq = _char_freq_vec([word])                         # (1, 26)
+	cand_freq = _vectorised_char_freq(cand_padded)          # (n_cand, 26)
+	# Input frequency vector
+	input_padded = _pad_words([word], max(M, 1))             # (1, M)
+	input_freq = _vectorised_char_freq(input_padded)          # (1, 26)
+
 	# Similarity = sum of min(input_count, cand_count) / max_len
 	freq_overlap = np.minimum(cand_freq, input_freq).sum(axis=1).astype(np.float64)
 	freq_score = freq_overlap / max(M, 1)                      # (n_cand,)
@@ -274,21 +284,42 @@ def spell_correct(
 
 	input_bg = _bigrams(word)
 	if input_bg:
-		bg_scores = np.array(
-			[len(_bigrams(w) & input_bg) / max(len(input_bg), 1) for w in cand_words],
-			dtype=np.float64,
-		)
+		# Vectorised bigram overlap using padded matrix
+		# Build bigram pairs from padded matrix columns
+		if cand_max_len >= 2:
+			bg_left = cand_padded[:, :-1]   # (n_cand, L-1)
+			bg_right = cand_padded[:, 1:]   # (n_cand, L-1)
+			# Encode bigrams as uint16: left*256 + right
+			cand_bg_encoded = bg_left.astype(np.uint16) * 256 + bg_right.astype(np.uint16)
+			# Only count where both chars are non-zero (not padding)
+			bg_valid = (bg_left > 0) & (bg_right > 0)
+			# Encode input bigrams the same way
+			input_bg_encoded = set()
+			for bg in input_bg:
+				if len(bg) == 2:
+					input_bg_encoded.add(ord(bg[0]) * 256 + ord(bg[1]))
+			input_bg_arr = np.array(list(input_bg_encoded), dtype=np.uint16)
+			# Count matches: for each candidate, how many of its bigrams are in input
+			# Use broadcasting: (n_cand, L-1, 1) == (1, 1, n_input_bg)
+			if input_bg_arr.size > 0:
+				matches = np.isin(cand_bg_encoded, input_bg_arr) & bg_valid
+				bg_scores = matches.sum(axis=1).astype(np.float64) / max(len(input_bg), 1)
+			else:
+				bg_scores = np.zeros(n_cand, dtype=np.float64)
+		else:
+			bg_scores = np.zeros(n_cand, dtype=np.float64)
 	else:
 		bg_scores = np.zeros(n_cand, dtype=np.float64)
 
-	# Combined pre-filter score
-	# Add prefix bonus: words sharing first 1–2 chars score higher
+	# Vectorised prefix scoring via padded matrix
+	word_bytes = word.encode("ascii", errors="replace")
 	prefix_scores = np.zeros(n_cand, dtype=np.float64)
-	for i, w in enumerate(cand_words):
-		if w and w[0] == word[0]:
-			prefix_scores[i] += 0.3
-			if len(w) >= 2 and M >= 2 and w[1] == word[1]:
-				prefix_scores[i] += 0.3
+	if M >= 1 and cand_max_len >= 1:
+		first_match = cand_padded[:, 0] == word_bytes[0]
+		prefix_scores[first_match] += 0.3
+		if M >= 2 and cand_max_len >= 2:
+			second_match = first_match & (cand_padded[:, 1] == word_bytes[1])
+			prefix_scores[second_match] += 0.3
 
 	pre_score = freq_score * 0.4 + bg_scores * 0.4 + prefix_scores * 0.2
 

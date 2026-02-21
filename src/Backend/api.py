@@ -1,8 +1,12 @@
 """
-NeuraLearn — Flask REST API
-============================
+NeuraLearn — Flask REST API  (spectral layout + vectorised)
+============================================================
 Exposes the backend algorithms (Webscraping, KnowledgeGraph, ACO, SDS)
 as JSON endpoints that the React frontend can consume.
+
+Layout uses spectral graph embedding (Laplacian eigenvectors) for natural
+node positioning, falling back to topological-depth layers when the graph
+is too small for meaningful spectral analysis.
 
 Endpoints
 ---------
@@ -19,6 +23,7 @@ import time
 import traceback
 from typing import Any
 
+import numpy as np
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
@@ -55,50 +60,97 @@ _LEVEL_ORDER = ["foundational", "intermediate", "advanced", "expert"]
 
 def _layout_nodes(kg: KnowledgeGraph) -> list[dict[str, Any]]:
     """
-    Compute layered positions for ReactFlow nodes from a KnowledgeGraph.
-    Uses the topological order and prerequisite depth to decide rows.
+    Compute node positions using spectral embedding + topological depth.
+
+    Strategy:
+      - Y axis: topological depth (vectorised via KnowledgeGraph.topological_depth_vector)
+      - X axis: spectral embedding (Fiedler vector / 2nd Laplacian eigenvector)
+                gives a natural left-right spread that groups related topics
+
+    Falls back to simple column layout if the graph is too small (<3 nodes)
+    for meaningful spectral analysis.
     """
     topo = kg.learning_order()
+    if not topo:
+        return []
 
-    # Compute depth of each node (longest path from a root)
-    depth: dict[int, int] = {}
-    for t in topo:
-        if not t.prerequisites:
-            depth[t.topic_id] = 0
-        else:
-            depth[t.topic_id] = max(depth[pid] for pid in t.prerequisites) + 1
+    # Vectorised depth computation
+    depth_vec = kg.topological_depth_vector()  # (N,) int32
+
+    max_depth = int(depth_vec[list(kg.topics.keys())].max()) if kg.topics else 0
+
+    # Try spectral positioning for x-axis
+    use_spectral = kg.num_topics >= 3
+    spectral_x: dict[int, float] = {}
+    if use_spectral:
+        try:
+            fiedler = kg.fiedler_vector()
+            # Normalise Fiedler vector to [-1, 1]
+            fv_vals = np.array([fiedler[t.topic_id] for t in topo])
+            fv_max = np.abs(fv_vals).max()
+            if fv_max > 1e-12:
+                fv_normed = fv_vals / fv_max
+            else:
+                fv_normed = np.zeros_like(fv_vals)
+            for i, t in enumerate(topo):
+                spectral_x[t.topic_id] = float(fv_normed[i])
+        except Exception:
+            use_spectral = False
 
     # Group by depth layer
     layers: dict[int, list] = {}
     for t in topo:
-        d = depth[t.topic_id]
+        d = int(depth_vec[t.topic_id])
         layers.setdefault(d, []).append(t)
 
-    max_depth = max(layers.keys()) if layers else 0
     nodes: list[dict[str, Any]] = []
     x_spacing = 260
     y_spacing = 140
+    center_x = 400
 
     for d, layer_topics in sorted(layers.items()):
         n = len(layer_topics)
-        total_width = (n - 1) * x_spacing
-        start_x = 400 - total_width / 2
 
-        for i, t in enumerate(layer_topics):
-            level_str = t.level.name.lower() if hasattr(t.level, "name") else str(t.level)
-            node_type = "input" if d == 0 else ("output" if d == max_depth else "default")
-            nodes.append({
-                "id":       str(t.topic_id),
-                "type":     node_type,
-                "position": {"x": round(start_x + i * x_spacing), "y": d * y_spacing},
-                "data": {
-                    "label":      t.name,
-                    "level":      level_str,
-                    "difficulty": _LEVEL_TO_DIFFICULTY.get(level_str, "intermediate"),
-                    "description": t.description or "",
-                    "mastered":   t.mastered,
-                },
-            })
+        if use_spectral and spectral_x:
+            # Sort layer by spectral x for consistent ordering
+            layer_topics.sort(key=lambda t: spectral_x.get(t.topic_id, 0.0))
+            # Use spectral values for x-positioning, scaled to viewport
+            for i, t in enumerate(layer_topics):
+                sx = spectral_x.get(t.topic_id, 0.0)
+                x = center_x + sx * (x_spacing * max(n - 1, 1) / 2)
+                level_str = t.level.name.lower() if hasattr(t.level, "name") else str(t.level)
+                node_type = "input" if d == 0 else ("output" if d == max_depth else "default")
+                nodes.append({
+                    "id":       str(t.topic_id),
+                    "type":     node_type,
+                    "position": {"x": round(x), "y": d * y_spacing},
+                    "data": {
+                        "label":      t.name,
+                        "level":      level_str,
+                        "difficulty": _LEVEL_TO_DIFFICULTY.get(level_str, "intermediate"),
+                        "description": t.description or "",
+                        "mastered":   t.mastered,
+                    },
+                })
+        else:
+            # Fallback: simple column-centred layout
+            total_width = (n - 1) * x_spacing
+            start_x = center_x - total_width / 2
+            for i, t in enumerate(layer_topics):
+                level_str = t.level.name.lower() if hasattr(t.level, "name") else str(t.level)
+                node_type = "input" if d == 0 else ("output" if d == max_depth else "default")
+                nodes.append({
+                    "id":       str(t.topic_id),
+                    "type":     node_type,
+                    "position": {"x": round(start_x + i * x_spacing), "y": d * y_spacing},
+                    "data": {
+                        "label":      t.name,
+                        "level":      level_str,
+                        "difficulty": _LEVEL_TO_DIFFICULTY.get(level_str, "intermediate"),
+                        "description": t.description or "",
+                        "mastered":   t.mastered,
+                    },
+                })
 
     return nodes
 

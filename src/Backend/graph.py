@@ -5,11 +5,14 @@ from torch_geometric.utils import degree
 from collections import deque
 from enum import Enum
 from dataclasses import dataclass, field
+from scipy import sparse as sp
+from scipy.sparse.linalg import eigsh
+from scipy.sparse.csgraph import connected_components
 
 """
-NeuraLearn Knowledge Graph  (optimised for repeated creation)
--------------------------------------------------------------
-Designed so the graph can be torn down and rebuilt many times cheaply:
+NeuraLearn Knowledge Graph  (optimised via spectral & topological graph theory)
+--------------------------------------------------------------------------------
+Performance & analytical features:
 
   • Topic uses __slots__ → ~40 % less memory per node, faster attr access
   • Adjacency stored as sets → O(1) duplicate-edge checks
@@ -18,6 +21,18 @@ Designed so the graph can be torn down and rebuilt many times cheaply:
   • Name index dict → O(1) lookup by name instead of O(n) scan
   • clear() wipes the graph in-place for reuse (no new object allocation)
   • rebuild_from_spec() builds from a lightweight list-of-dicts spec
+
+Spectral graph theory (new):
+  • Laplacian matrices (unnormalised, symmetric normalised) via scipy sparse
+  • Spectral embedding (k smallest non-trivial eigenvectors) → O(E) via ARPACK
+  • Fiedler vector & algebraic connectivity (λ₂) for graph partitioning
+  • Spectral clustering via k-means on Laplacian eigenvectors
+  • Spectral gap (λ₂/λ₁) for connectivity analysis
+
+Topological graph theory (new):
+  • Vectorised depth computation via NumPy in-degree BFS
+  • Betti number β₀ (connected components) via scipy sparse
+  • Vectorised shortest-path-to via predecessor bitmask
 """
 
 
@@ -103,6 +118,7 @@ class KnowledgeGraph:
 		"device", "topics", "_next_id",
 		"_name_index",
 		"_edge_index_cache", "_degree_cache", "_topo_cache",
+		"_laplacian_cache", "_spectral_cache",
 	)
 
 	def __init__(
@@ -116,6 +132,8 @@ class KnowledgeGraph:
 		self._edge_index_cache: torch.Tensor | None = None
 		self._degree_cache: dict[str, torch.Tensor] = {}
 		self._topo_cache: list[Topic] | None = None     # cached topo sort
+		self._laplacian_cache: dict[str, sp.csc_matrix] = {}
+		self._spectral_cache: dict[str, np.ndarray] = {}  # cached eigenvectors/values
 
 	# ---- helpers -----------------------------------------------------------
 	@property
@@ -126,6 +144,8 @@ class KnowledgeGraph:
 		self._edge_index_cache = None
 		self._degree_cache.clear()
 		self._topo_cache = None
+		self._laplacian_cache.clear()
+		self._spectral_cache.clear()
 
 	# ---- clear & reuse (avoids allocating a new KnowledgeGraph) ------------
 	def clear(self) -> None:
@@ -391,6 +411,322 @@ class KnowledgeGraph:
 		n = max(self.topics) + 1 if self.topics else 0
 		vals = torch.ones(ei.size(1), device=self.device)
 		return torch.sparse_coo_tensor(ei, vals, size=(n, n)).coalesce()
+
+	# ---- spectral graph theory ---------------------------------------------
+
+	def _scipy_adjacency(self) -> sp.csc_matrix:
+		"""Build scipy sparse adjacency (symmetrised for undirected Laplacian)."""
+		cached = self._laplacian_cache.get("adj")
+		if cached is not None:
+			return cached
+		n = max(self.topics) + 1 if self.topics else 0
+		if n == 0:
+			m = sp.csc_matrix((0, 0), dtype=np.float64)
+			self._laplacian_cache["adj"] = m
+			return m
+		rows, cols = [], []
+		for t in self.topics.values():
+			for u in t.unlocks:
+				rows.append(t.topic_id)
+				cols.append(u)
+				# symmetrise (treat DAG as undirected for spectral analysis)
+				rows.append(u)
+				cols.append(t.topic_id)
+		data = np.ones(len(rows), dtype=np.float64)
+		A = sp.csc_matrix((data, (rows, cols)), shape=(n, n), dtype=np.float64)
+		# remove duplicates & self-loops
+		A = A.minimum(sp.csc_matrix(np.ones((n, n))))
+		A.setdiag(0)
+		A.eliminate_zeros()
+		self._laplacian_cache["adj"] = A
+		return A
+
+	def build_laplacian(self) -> sp.csc_matrix:
+		"""
+		Unnormalised graph Laplacian  L = D - A  (sparse, cached).
+
+		The Laplacian is computed on the symmetrised (undirected) version
+		of the DAG, which is standard for spectral analysis on directed
+		knowledge graphs.
+		"""
+		cached = self._laplacian_cache.get("L")
+		if cached is not None:
+			return cached
+		A = self._scipy_adjacency()
+		n = A.shape[0]
+		if n == 0:
+			L = sp.csc_matrix((0, 0), dtype=np.float64)
+			self._laplacian_cache["L"] = L
+			return L
+		D = sp.diags(np.asarray(A.sum(axis=1)).flatten(), format="csc")
+		L = D - A
+		self._laplacian_cache["L"] = L
+		return L
+
+	def build_normalised_laplacian(self) -> sp.csc_matrix:
+		"""
+		Symmetric normalised Laplacian  L_sym = I - D^{-1/2} A D^{-1/2}.
+
+		Eigenvalues lie in [0, 2].  Used for scale-invariant spectral methods.
+		"""
+		cached = self._laplacian_cache.get("Lnorm")
+		if cached is not None:
+			return cached
+		A = self._scipy_adjacency()
+		n = A.shape[0]
+		if n == 0:
+			Ln = sp.csc_matrix((0, 0), dtype=np.float64)
+			self._laplacian_cache["Lnorm"] = Ln
+			return Ln
+		deg = np.asarray(A.sum(axis=1)).flatten()
+		# D^{-1/2}, handling zero-degree nodes
+		with np.errstate(divide="ignore"):
+			d_inv_sqrt = np.where(deg > 0, 1.0 / np.sqrt(deg), 0.0)
+		D_inv_sqrt = sp.diags(d_inv_sqrt, format="csc")
+		Ln = sp.eye(n, format="csc") - D_inv_sqrt @ A @ D_inv_sqrt
+		self._laplacian_cache["Lnorm"] = Ln
+		return Ln
+
+	def spectral_eigenvalues(self, k: int = 6) -> np.ndarray:
+		"""
+		Compute the k smallest eigenvalues of the unnormalised Laplacian.
+
+		Uses ARPACK (shift-invert) via scipy.sparse.linalg.eigsh → O(E·k).
+		Cached so repeated calls are free.
+		"""
+		cache_key = f"eigenvalues_{k}"
+		cached = self._spectral_cache.get(cache_key)
+		if cached is not None:
+			return cached
+		L = self.build_laplacian()
+		n = L.shape[0]
+		if n == 0:
+			vals = np.array([], dtype=np.float64)
+			self._spectral_cache[cache_key] = vals
+			return vals
+		k = min(k, n - 1) if n > 1 else 0
+		if k <= 0:
+			vals = np.array([0.0], dtype=np.float64)
+			self._spectral_cache[cache_key] = vals
+			return vals
+		vals, _ = eigsh(L.astype(np.float64), k=k, which="SM", sigma=-0.5)
+		vals = np.sort(np.real(vals))
+		self._spectral_cache[cache_key] = vals
+		return vals
+
+	def algebraic_connectivity(self) -> float:
+		"""
+		Fiedler value λ₂  — second-smallest eigenvalue of the Laplacian.
+
+		Measures how well-connected the graph is:
+		  • λ₂ = 0 → disconnected graph
+		  • larger λ₂ → harder to partition / more tightly connected
+		"""
+		vals = self.spectral_eigenvalues(k=3)
+		return float(vals[1]) if len(vals) >= 2 else 0.0
+
+	def spectral_gap(self) -> float:
+		"""
+		Ratio  λ₂ / λ_max  — normalised connectivity measure in [0, 1].
+
+		A large spectral gap indicates strong expander-like connectivity.
+		"""
+		vals = self.spectral_eigenvalues(k=6)
+		if len(vals) < 2:
+			return 0.0
+		lam_max = vals[-1]
+		return float(vals[1] / lam_max) if lam_max > 1e-12 else 0.0
+
+	def fiedler_vector(self) -> np.ndarray:
+		"""
+		Eigenvector corresponding to λ₂ (the algebraic connectivity).
+
+		The Fiedler vector partitions the graph optimally: nodes with
+		positive vs negative components form the two clusters that
+		minimise the graph cut (Cheeger's inequality).
+		"""
+		cache_key = "fiedler"
+		cached = self._spectral_cache.get(cache_key)
+		if cached is not None:
+			return cached
+		L = self.build_laplacian()
+		n = L.shape[0]
+		if n <= 1:
+			v = np.zeros(max(n, 0), dtype=np.float64)
+			self._spectral_cache[cache_key] = v
+			return v
+		k = min(3, n - 1)
+		if k < 2:
+			v = np.zeros(n, dtype=np.float64)
+			self._spectral_cache[cache_key] = v
+			return v
+		vals_f, vecs_f = eigsh(L.astype(np.float64), k=k, which="SM", sigma=-0.5)
+		order = np.argsort(np.real(vals_f))
+		v = np.real(vecs_f[:, order[1]])
+		self._spectral_cache[cache_key] = v
+		return v
+
+	def spectral_embedding(self, k: int = 3) -> np.ndarray:
+		"""
+		Embed graph nodes into k-dimensional Euclidean space using the
+		k smallest non-trivial eigenvectors of the normalised Laplacian.
+
+		Returns (N, k) array where N = max(topic_id)+1.  Row i is the
+		embedding of topic i.  Useful for layout, clustering, and as
+		a heuristic distance for ACO.
+		"""
+		cache_key = f"embedding_{k}"
+		cached = self._spectral_cache.get(cache_key)
+		if cached is not None:
+			return cached
+		Ln = self.build_normalised_laplacian()
+		n = Ln.shape[0]
+		if n <= 1:
+			emb = np.zeros((max(n, 0), k), dtype=np.float64)
+			self._spectral_cache[cache_key] = emb
+			return emb
+		nev = min(k + 1, n - 1)
+		if nev < 2:
+			emb = np.zeros((n, k), dtype=np.float64)
+			self._spectral_cache[cache_key] = emb
+			return emb
+		vals, vecs = eigsh(Ln.astype(np.float64), k=nev, which="SM", sigma=-0.5)
+		order = np.argsort(np.real(vals))
+		# skip the trivial (constant) eigenvector (index 0)
+		emb = np.real(vecs[:, order[1:k + 1]])
+		# pad if fewer eigenvectors than requested
+		if emb.shape[1] < k:
+			pad = np.zeros((n, k - emb.shape[1]), dtype=np.float64)
+			emb = np.hstack([emb, pad])
+		self._spectral_cache[cache_key] = emb
+		return emb
+
+	def spectral_clustering(self, n_clusters: int = 3) -> np.ndarray:
+		"""
+		Partition topics into n_clusters groups via spectral clustering.
+
+		Steps (Ng-Jordan-Weiss algorithm):
+		  1. Compute n_clusters-dimensional spectral embedding
+		  2. Row-normalise the embedding
+		  3. Run k-means on the rows
+
+		Returns (N,) int array of cluster labels (0..n_clusters-1).
+		"""
+		emb = self.spectral_embedding(k=n_clusters)
+		n = emb.shape[0]
+		if n == 0:
+			return np.array([], dtype=np.int32)
+
+		# Row-normalise (Ng-Jordan-Weiss)
+		norms = np.linalg.norm(emb, axis=1, keepdims=True)
+		norms = np.where(norms > 1e-12, norms, 1.0)
+		emb_normed = emb / norms
+
+		# k-means (vectorised Lloyd's algorithm — no sklearn dependency)
+		rng = np.random.default_rng(42)
+		# k-means++ initialisation
+		centers = np.empty((n_clusters, emb_normed.shape[1]), dtype=np.float64)
+		centers[0] = emb_normed[rng.integers(n)]
+		for c in range(1, n_clusters):
+			dists = np.linalg.norm(
+				emb_normed[:, None, :] - centers[None, :c, :], axis=2
+			).min(axis=1)
+			dists_sq = dists ** 2
+			total = dists_sq.sum()
+			if total < 1e-15:
+				centers[c] = emb_normed[rng.integers(n)]
+			else:
+				probs = dists_sq / total
+				centers[c] = emb_normed[rng.choice(n, p=probs)]
+
+		labels = np.zeros(n, dtype=np.int32)
+		for _ in range(30):
+			# Assign
+			dists = np.linalg.norm(
+				emb_normed[:, None, :] - centers[None, :, :], axis=2
+			)  # (N, n_clusters)
+			new_labels = dists.argmin(axis=1).astype(np.int32)
+			if np.array_equal(new_labels, labels):
+				break
+			labels = new_labels
+			# Update centres
+			for c in range(n_clusters):
+				members = emb_normed[labels == c]
+				if members.shape[0] > 0:
+					centers[c] = members.mean(axis=0)
+
+		return labels
+
+	def spectral_distances(self) -> np.ndarray:
+		"""
+		Pairwise Euclidean distances in spectral embedding space.
+
+		Returns (N, N) float64 matrix.  D[i,j] is small when topics i,j
+		are spectrally close (should be studied together).
+		"""
+		emb = self.spectral_embedding(k=3)
+		n = emb.shape[0]
+		if n == 0:
+			return np.empty((0, 0), dtype=np.float64)
+		# Vectorised pairwise: ||a-b||² = ||a||² + ||b||² - 2·a·b
+		sq = (emb ** 2).sum(axis=1)
+		D2 = sq[:, None] + sq[None, :] - 2.0 * emb @ emb.T
+		np.maximum(D2, 0.0, out=D2)  # clamp numerical noise
+		return np.sqrt(D2)
+
+	# ---- topological analysis (vectorised) ---------------------------------
+
+	def betti_0(self) -> int:
+		"""
+		Betti number β₀ = number of connected components (undirected).
+
+		Computed via scipy sparse connected_components → O(V + E).
+		"""
+		A = self._scipy_adjacency()
+		if A.shape[0] == 0:
+			return 0
+		n_comp, _ = connected_components(A, directed=False)
+		return int(n_comp)
+
+	def topological_depth_vector(self) -> np.ndarray:
+		"""
+		Vectorised longest-path depth for every node via NumPy BFS.
+
+		Returns (N,) int32 array where depth[i] = length of the longest
+		path from any root (zero in-degree) to node i.  This is computed
+		as part of the Kahn's algorithm using vectorised in-degree updates.
+		"""
+		cache_key = "topo_depth"
+		cached = self._spectral_cache.get(cache_key)
+		if cached is not None:
+			return cached
+		n = max(self.topics) + 1 if self.topics else 0
+		if n == 0:
+			d = np.array([], dtype=np.int32)
+			self._spectral_cache[cache_key] = d
+			return d
+		# build adjacency as numpy arrays of src->dst
+		depth = np.zeros(n, dtype=np.int32)
+		in_deg = np.zeros(n, dtype=np.int32)
+		for t in self.topics.values():
+			for u in t.unlocks:
+				in_deg[u] += 1
+		queue = deque()
+		for tid in self.topics:
+			if in_deg[tid] == 0:
+				queue.append(tid)
+				depth[tid] = 0
+		while queue:
+			tid = queue.popleft()
+			for u in self.topics[tid].unlocks:
+				new_d = depth[tid] + 1
+				if new_d > depth[u]:
+					depth[u] = new_d
+				in_deg[u] -= 1
+				if in_deg[u] == 0:
+					queue.append(u)
+		self._spectral_cache[cache_key] = depth
+		return depth
 
 	def to_pyg_data(self) -> Data:
 		ei = self.build_edge_index()

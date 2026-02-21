@@ -33,9 +33,12 @@ import { Progress } from "../components/ui/progress";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 import {
   ArrowLeft,
+  ArrowRight,
   Brain,
   CheckCircle2,
+  ChevronDown,
   Circle,
+  Clock,
   Play,
   Route,
   Sparkles,
@@ -206,11 +209,35 @@ export function KnowledgeGraph() {
     }
   }, []);
 
+  const levelBadgeColor = useCallback((level: string) => {
+    switch (level) {
+      case "foundational":
+        return "bg-green-100 text-green-700 border-green-200";
+      case "intermediate":
+        return "bg-yellow-100 text-yellow-700 border-yellow-200";
+      case "advanced":
+        return "bg-orange-100 text-orange-700 border-orange-200";
+      case "expert":
+        return "bg-red-100 text-red-700 border-red-200";
+      default:
+        return "bg-gray-100 text-gray-600 border-gray-200";
+    }
+  }, []);
+
   const calculateProgress = useMemo(() => {
     if (!selectedPath) return 0;
     const done = selectedPath.nodeIds.filter((id) => completedNodes.has(id)).length;
     return (done / selectedPath.nodeIds.length) * 100;
   }, [selectedPath, completedNodes]);
+
+  /* Build a lookup from node id -> node for the detail view */
+  const nodeMap = useMemo(() => {
+    const m = new Map<string, Node>();
+    if (graphData) {
+      for (const n of graphData.nodes) m.set(n.id, n);
+    }
+    return m;
+  }, [graphData]);
 
   /* ── Sidebar content (shared between mobile sheet & desktop aside) ── */
   const sidebarContent = graphData ? (
@@ -228,68 +255,210 @@ export function KnowledgeGraph() {
 
       {/* -- Paths tab -- */}
       <TabsContent value="paths" className="p-4 space-y-3">
+        {/* Header */}
         <div className="mb-4">
           <h3 className="font-semibold mb-1 flex items-center gap-2">
             <Sparkles className="size-4 text-purple-600" />
-            Choose Your Learning Path
+            {selectedPath ? selectedPath.name : "Choose Your Learning Path"}
           </h3>
           <p className="text-xs text-gray-500">
-            Select a path to highlight your journey through the knowledge graph
+            {selectedPath
+              ? selectedPath.description
+              : "Select a path to highlight your journey through the knowledge graph"}
           </p>
         </div>
 
-        {graphData.paths.map((path) => (
-          <motion.div
-            key={path.id}
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-          >
-            <Card
-              className={`cursor-pointer transition-all ${
-                selectedPath?.id === path.id
-                  ? "ring-2 ring-purple-500 shadow-md"
-                  : "hover:shadow-md"
-              }`}
-              onClick={() =>
-                setSelectedPath(selectedPath?.id === path.id ? null : path)
-              }
+        {/* ── Path picker (no path selected) ── */}
+        {!selectedPath &&
+          graphData.paths.map((path) => (
+            <motion.div
+              key={path.id}
+              whileHover={{ scale: 1.02 }}
+              whileTap={{ scale: 0.98 }}
             >
-              <CardHeader className="pb-3">
-                <div className="flex items-start justify-between">
-                  <CardTitle className="text-sm">{path.name}</CardTitle>
-                  <Badge
-                    className={difficultyColor(path.difficulty)}
-                    variant="outline"
-                  >
-                    {path.difficulty}
-                  </Badge>
-                </div>
-                <CardDescription className="text-xs">
-                  {path.description}
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="pb-3">
-                <div className="flex items-center justify-between text-xs text-gray-600">
-                  <span className="flex items-center gap-1">
-                    <TrendingUp className="size-3" />
-                    {path.nodeIds.length} topics
-                  </span>
-                  <span>{path.duration}</span>
-                </div>
-              </CardContent>
-            </Card>
-          </motion.div>
-        ))}
+              <Card
+                className="cursor-pointer transition-all hover:shadow-md"
+                onClick={() => setSelectedPath(path)}
+              >
+                <CardHeader className="pb-3">
+                  <div className="flex items-start justify-between">
+                    <CardTitle className="text-sm">{path.name}</CardTitle>
+                    <Badge
+                      className={difficultyColor(path.difficulty)}
+                      variant="outline"
+                    >
+                      {path.difficulty}
+                    </Badge>
+                  </div>
+                  <CardDescription className="text-xs">
+                    {path.description}
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="pb-3">
+                  <div className="flex items-center justify-between text-xs text-gray-600">
+                    <span className="flex items-center gap-1">
+                      <TrendingUp className="size-3" />
+                      {path.nodeIds.length} topics
+                    </span>
+                    <span>{path.duration}</span>
+                  </div>
+                </CardContent>
+              </Card>
+            </motion.div>
+          ))}
 
+        {/* ── Expanded path detail (path selected) ── */}
         {selectedPath && (
-          <Button
-            variant="outline"
-            size="sm"
-            className="w-full"
-            onClick={() => setSelectedPath(null)}
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="space-y-3"
           >
-            Clear Selection
-          </Button>
+            {/* Stats row */}
+            <div className="grid grid-cols-3 gap-2 text-center">
+              <div className="rounded-lg border bg-purple-50 p-2">
+                <p className="text-lg font-bold text-purple-700">
+                  {selectedPath.nodeIds.length}
+                </p>
+                <p className="text-[10px] text-purple-600">Topics</p>
+              </div>
+              <div className="rounded-lg border bg-green-50 p-2">
+                <p className="text-lg font-bold text-green-700">
+                  {selectedPath.nodeIds.filter((id) => completedNodes.has(id)).length}
+                </p>
+                <p className="text-[10px] text-green-600">Completed</p>
+              </div>
+              <div className="rounded-lg border bg-blue-50 p-2">
+                <p className="text-lg font-bold text-blue-700">
+                  {Math.round(calculateProgress)}%
+                </p>
+                <p className="text-[10px] text-blue-600">Progress</p>
+              </div>
+            </div>
+
+            {/* Progress bar */}
+            <Progress value={calculateProgress} className="h-2" />
+
+            {/* Difficulty + estimated time */}
+            <div className="flex items-center gap-2 text-xs text-gray-500">
+              <Badge
+                className={difficultyColor(selectedPath.difficulty)}
+                variant="outline"
+              >
+                {selectedPath.difficulty}
+              </Badge>
+              <span className="flex items-center gap-1">
+                <Clock className="size-3" />
+                {selectedPath.duration}
+              </span>
+            </div>
+
+            {/* Step-by-step topic list */}
+            <div className="space-y-1">
+              <h4 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                Learning Order
+              </h4>
+              {selectedPath.nodeIds.map((id, idx) => {
+                const node = nodeMap.get(id);
+                if (!node) return null;
+                const label = node.data.label as string;
+                const level = (node.data.level as string) ?? "";
+                const desc = (node.data.description as string) ?? "";
+                const done = completedNodes.has(id);
+                const isLast = idx === selectedPath.nodeIds.length - 1;
+
+                return (
+                  <div key={id} className="flex gap-2">
+                    {/* Timeline spine */}
+                    <div className="flex flex-col items-center">
+                      <button
+                        onClick={() => toggleNodeCompletion(id)}
+                        className="relative z-10 flex-shrink-0"
+                      >
+                        {done ? (
+                          <CheckCircle2 className="size-5 text-green-600" />
+                        ) : (
+                          <div className="size-5 rounded-full border-2 border-purple-300 bg-white flex items-center justify-center text-[9px] font-bold text-purple-500">
+                            {idx + 1}
+                          </div>
+                        )}
+                      </button>
+                      {!isLast && (
+                        <div className="w-px flex-1 bg-gray-200 my-0.5" />
+                      )}
+                    </div>
+
+                    {/* Content */}
+                    <div
+                      className={`flex-1 pb-3 ${
+                        done ? "opacity-60" : ""
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          className={`text-sm font-medium leading-tight ${
+                            done ? "line-through text-gray-400" : "text-gray-800"
+                          }`}
+                        >
+                          {label}
+                        </span>
+                        {level && (
+                          <span
+                            className={`inline-block px-1.5 py-px rounded text-[9px] font-medium border ${
+                              levelBadgeColor(level)
+                            }`}
+                          >
+                            {level}
+                          </span>
+                        )}
+                      </div>
+                      {desc && (
+                        <p className="text-[11px] text-gray-500 mt-0.5 leading-snug">
+                          {desc}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Actions */}
+            <div className="flex gap-2 pt-1">
+              <Button
+                variant="outline"
+                size="sm"
+                className="flex-1 gap-1"
+                onClick={() => setSelectedPath(null)}
+              >
+                <ArrowLeft className="size-3" />
+                All Paths
+              </Button>
+              <Button
+                size="sm"
+                className="flex-1 gap-1 bg-purple-600 hover:bg-purple-700"
+                onClick={() => {
+                  /* Find the first incomplete node in this path and open its detail */
+                  const nextId = selectedPath.nodeIds.find(
+                    (nid) => !completedNodes.has(nid),
+                  );
+                  if (nextId) {
+                    const n = nodeMap.get(nextId);
+                    if (n) setSelectedNode(n);
+                  } else {
+                    toast.success("All done!", {
+                      description: "You've completed every topic in this path.",
+                    });
+                  }
+                }}
+              >
+                <Play className="size-3" />
+                {selectedPath.nodeIds.every((nid) => completedNodes.has(nid))
+                  ? "All Complete!"
+                  : "Continue Learning"}
+              </Button>
+            </div>
+          </motion.div>
         )}
       </TabsContent>
 

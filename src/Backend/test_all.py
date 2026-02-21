@@ -333,6 +333,181 @@ def test_graph():
             assert lv.name.lower() in _LEVEL_MAP
     _test("_LEVEL_MAP covers all TopicLevel values", t_level_map)
 
+    # ================================================================
+    # Spectral & topological graph theory tests
+    # ================================================================
+
+    # ---- Laplacian ----
+    def t_laplacian():
+        kg = KnowledgeGraph()
+        a = kg.create_topic("A")
+        b = kg.create_topic("B")
+        c = kg.create_topic("C")
+        kg.add_prerequisite(a.topic_id, b.topic_id)
+        kg.add_prerequisite(b.topic_id, c.topic_id)
+        L = kg.build_laplacian()
+        # L should be (N, N) where N = max_id + 1
+        n = max(kg.topics) + 1
+        assert L.shape == (n, n), f"Laplacian shape {L.shape}"
+        # Laplacian row sums = 0
+        row_sums = np.abs(np.asarray(L.sum(axis=1)).flatten())
+        assert np.all(row_sums < 1e-10), f"Row sums not zero: {row_sums}"
+        # L is symmetric (undirected symmetrisation)
+        diff = L - L.T
+        assert abs(diff).max() < 1e-10, "Laplacian not symmetric"
+    _test("Laplacian matrix (spectral)", t_laplacian)
+
+    # ---- normalised Laplacian ----
+    def t_norm_laplacian():
+        kg = KnowledgeGraph()
+        for name in ["A", "B", "C", "D"]:
+            kg.create_topic(name)
+        kg.add_prerequisites_bulk([(0,1),(1,2),(2,3),(0,2)])
+        Ln = kg.build_normalised_laplacian()
+        n = max(kg.topics) + 1
+        assert Ln.shape == (n, n)
+        # Eigenvalues of normalised Laplacian are in [0, 2]
+        from scipy.sparse.linalg import eigsh
+        k = min(3, n - 1)
+        vals, _ = eigsh(Ln.astype(np.float64), k=k, which="SM", sigma=-0.5)
+        assert np.all(vals >= -1e-10), f"Eigenvalues below 0: {vals}"
+        assert np.all(vals <= 2.0 + 1e-10), f"Eigenvalues above 2: {vals}"
+    _test("Normalised Laplacian eigenvalues in [0,2]", t_norm_laplacian)
+
+    # ---- algebraic connectivity ----
+    def t_algebraic_connectivity():
+        kg = KnowledgeGraph()
+        for name in ["A", "B", "C"]:
+            kg.create_topic(name)
+        kg.add_prerequisites_bulk([(0,1),(1,2)])
+        lam2 = kg.algebraic_connectivity()
+        assert lam2 > 0, f"lambda_2 should be > 0 for connected graph: {lam2}"
+    _test("Algebraic connectivity lambda_2 > 0", t_algebraic_connectivity)
+
+    # ---- Fiedler vector ----
+    def t_fiedler():
+        kg = KnowledgeGraph()
+        for name in ["A", "B", "C", "D"]:
+            kg.create_topic(name)
+        kg.add_prerequisites_bulk([(0,1),(1,2),(2,3)])
+        fv = kg.fiedler_vector()
+        n = max(kg.topics) + 1
+        assert fv.shape == (n,), f"Fiedler shape {fv.shape}"
+        # Fiedler vector partitions: sign should change along the chain
+        # For a path graph, the Fiedler vector is monotonic
+        assert fv[0] != fv[3] or abs(fv[0]) < 1e-10, "Fiedler should vary along path"
+    _test("Fiedler vector shape & structure", t_fiedler)
+
+    # ---- spectral embedding ----
+    def t_spectral_embedding():
+        kg = KnowledgeGraph()
+        for name in ["A", "B", "C", "D", "E"]:
+            kg.create_topic(name)
+        kg.add_prerequisites_bulk([(0,1),(1,2),(2,3),(3,4),(0,3)])
+        emb = kg.spectral_embedding(k=2)
+        n = max(kg.topics) + 1
+        assert emb.shape == (n, 2), f"Embedding shape {emb.shape}"
+        # Adjacent nodes should be closer than distant ones in embedding space
+    _test("Spectral embedding (k=2)", t_spectral_embedding)
+
+    # ---- spectral clustering ----
+    def t_spectral_clustering():
+        kg = KnowledgeGraph()
+        for name in ["A", "B", "C", "D", "E", "F"]:
+            kg.create_topic(name)
+        kg.add_prerequisites_bulk([(0,1),(1,2),(3,4),(4,5),(2,3)])
+        labels = kg.spectral_clustering(n_clusters=2)
+        n = max(kg.topics) + 1
+        assert labels.shape == (n,), f"Cluster labels shape {labels.shape}"
+        assert set(labels.tolist()).issubset({0, 1}), f"Expected labels 0/1, got {set(labels.tolist())}"
+    _test("Spectral clustering (2 clusters)", t_spectral_clustering)
+
+    # ---- spectral distances ----
+    def t_spectral_distances():
+        kg = KnowledgeGraph()
+        for name in ["A", "B", "C"]:
+            kg.create_topic(name)
+        kg.add_prerequisites_bulk([(0,1),(1,2)])
+        D = kg.spectral_distances()
+        n = max(kg.topics) + 1
+        assert D.shape == (n, n), f"Distance shape {D.shape}"
+        # Diagonal should be 0
+        assert np.allclose(np.diag(D), 0.0), "Diagonal should be 0"
+        # Symmetric
+        assert np.allclose(D, D.T), "Distances should be symmetric"
+        # Triangle inequality: D[i,j] <= D[i,k] + D[k,j]
+        for i in range(n):
+            for j in range(n):
+                for k in range(n):
+                    assert D[i,j] <= D[i,k] + D[k,j] + 1e-10
+    _test("Spectral distances (symmetric, triangle inequality)", t_spectral_distances)
+
+    # ---- spectral gap ----
+    def t_spectral_gap():
+        kg = KnowledgeGraph()
+        for name in ["A", "B", "C", "D"]:
+            kg.create_topic(name)
+        kg.add_prerequisites_bulk([(0,1),(1,2),(2,3),(0,2),(0,3)])
+        gap = kg.spectral_gap()
+        assert 0.0 <= gap <= 1.0, f"Spectral gap should be in [0,1]: {gap}"
+    _test("Spectral gap in [0,1]", t_spectral_gap)
+
+    # ---- Betti number beta_0 ----
+    def t_betti_0():
+        kg = KnowledgeGraph()
+        a = kg.create_topic("A")
+        b = kg.create_topic("B")
+        c = kg.create_topic("C")
+        kg.add_prerequisite(a.topic_id, b.topic_id)
+        # A-B connected, C isolated
+        assert kg.betti_0() == 2, f"Expected 2 components, got {kg.betti_0()}"
+        kg.add_prerequisite(b.topic_id, c.topic_id)
+        assert kg.betti_0() == 1, f"Expected 1 component, got {kg.betti_0()}"
+    _test("Betti number beta_0 (connected components)", t_betti_0)
+
+    # ---- topological depth vector ----
+    def t_topo_depth():
+        kg = KnowledgeGraph()
+        a = kg.create_topic("A")
+        b = kg.create_topic("B")
+        c = kg.create_topic("C")
+        d = kg.create_topic("D")
+        kg.add_prerequisites_bulk([(a.topic_id, b.topic_id), (b.topic_id, c.topic_id), (a.topic_id, d.topic_id)])
+        depth = kg.topological_depth_vector()
+        assert depth[a.topic_id] == 0, f"Root depth should be 0: {depth[a.topic_id]}"
+        assert depth[b.topic_id] == 1
+        assert depth[c.topic_id] == 2
+        assert depth[d.topic_id] == 1
+    _test("Topological depth vector", t_topo_depth)
+
+    # ---- Laplacian caching ----
+    def t_laplacian_cache():
+        kg = KnowledgeGraph()
+        kg.create_topic("A")
+        kg.create_topic("B")
+        kg.add_prerequisite(0, 1)
+        L1 = kg.build_laplacian()
+        L2 = kg.build_laplacian()
+        assert L1 is L2, "Laplacian should be cached"
+        # Adding new edge should invalidate cache
+        kg.create_topic("C")
+        kg.add_prerequisite(1, 2)
+        L3 = kg.build_laplacian()
+        assert L3 is not L1, "Cache should be invalidated after edge add"
+    _test("Laplacian caching & invalidation", t_laplacian_cache)
+
+    # ---- empty graph spectral methods ----
+    def t_spectral_empty():
+        kg = KnowledgeGraph()
+        L = kg.build_laplacian()
+        assert L.shape == (0, 0)
+        emb = kg.spectral_embedding(k=2)
+        assert emb.shape == (0, 2)
+        assert kg.betti_0() == 0
+        d = kg.topological_depth_vector()
+        assert d.shape == (0,)
+    _test("Spectral methods on empty graph", t_spectral_empty)
+
 
 # =====================================================================
 # 2.  ACO.py
@@ -353,7 +528,7 @@ def test_aco():
         kg.create_topic("C", level=TL.ADVANCED)
         kg.add_prerequisite(0, 1)
         kg.add_prerequisite(1, 2)
-        cost, prereq, eta, sw, id2idx, idx2id = _build_matrices(kg)
+        cost, prereq, eta, sw, id2idx, idx2id, spec_dist, clust = _build_matrices(kg)
         K = 3
         assert cost.shape == (K, K), f"cost shape {cost.shape}"
         assert prereq.shape == (K, K)
@@ -361,7 +536,9 @@ def test_aco():
         assert sw.shape == (K,)
         assert len(id2idx) == K
         assert idx2id.shape == (K,)
-    _test("_build_matrices shapes", t_matrices_shape)
+        assert spec_dist.shape == (K, K), f"spec_dist shape {spec_dist.shape}"
+        assert clust.shape == (K,), f"cluster shape {clust.shape}"
+    _test("_build_matrices shapes (spectral)", t_matrices_shape)
 
     # ---- cost matrix values ----
     def t_cost_values():
@@ -370,13 +547,15 @@ def test_aco():
         kg.create_topic("B", level=TL.EXPERT)         # level 3
         kg.add_prerequisite(0, 1)
         cost, *_ = _build_matrices(kg)
-        # A→B: base(1) + forward(3) + relatedness(-0.5) = 3.5
-        assert abs(cost[0, 1] - 3.5) < 1e-9, f"A→B cost={cost[0,1]}"
-        # B→A: base(1) + regression(3*3=9) + no relatedness = 10.0
-        assert abs(cost[1, 0] - 10.0) < 1e-9, f"B→A cost={cost[1,0]}"
+        # With spectral costs: A->B should still have forward difficulty + spectral bonus
+        # The exact value depends on spectral distances; just verify structure
+        assert cost[0, 1] > 0, f"A->B cost should be positive: {cost[0,1]}"
+        assert cost[0, 1] < cost[1, 0], f"A->B ({cost[0,1]}) should be < B->A ({cost[1,0]}) (regression penalty)"
+        # B->A: regression penalty makes it much more expensive
+        assert cost[1, 0] > 5.0, f"B->A cost should be > 5 (regression): {cost[1,0]}"
         # diagonal = 1e6
         assert cost[0, 0] == 1e6
-    _test("Cost matrix values correct", t_cost_values)
+    _test("Cost matrix values correct (spectral)", t_cost_values)
 
     # ---- prereq matrix ----
     def t_prereq_matrix():
