@@ -686,14 +686,52 @@ export function KnowledgeGraph() {
               <p className="text-sm text-gray-600">{selectedNode.data.description}</p>
             )}
 
-            <div>
-              <h4 className="font-medium mb-2">About this topic:</h4>
-              <p className="text-sm text-gray-600">
-                This is a key concept in {decodedSkill}. Click below to generate
-                a detailed sub-graph that breaks down this topic into smaller,
-                manageable learning units.
-              </p>
-            </div>
+            {/* Prerequisites */}
+            {(selectedNode?.data.prerequisites as string[] | undefined)?.length ? (
+              <div>
+                <h4 className="font-medium mb-1 text-sm flex items-center gap-1.5">
+                  <ArrowLeft className="size-3.5 text-amber-500" />
+                  Prerequisites
+                </h4>
+                <div className="flex flex-wrap gap-1.5">
+                  {(selectedNode!.data.prerequisites as string[]).map((p: string) => (
+                    <Badge key={p} variant="outline" className="bg-amber-50 text-amber-700 border-amber-200 text-xs">
+                      {p}
+                    </Badge>
+                  ))}
+                </div>
+                <p className="text-xs text-gray-500 mt-1">
+                  Complete these first to unlock this topic
+                </p>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 text-sm text-green-600 bg-green-50 rounded-lg p-2">
+                <CheckCircle2 className="size-4" />
+                <span className="font-medium">No prerequisites — you can start right away!</span>
+              </div>
+            )}
+
+            {/* Unlocks */}
+            {(selectedNode?.data.unlocks as string[] | undefined)?.length ? (
+              <div>
+                <h4 className="font-medium mb-1 text-sm flex items-center gap-1.5">
+                  <ArrowRight className="size-3.5 text-purple-500" />
+                  Mastering this unlocks
+                </h4>
+                <div className="flex flex-wrap gap-1.5">
+                  {(selectedNode!.data.unlocks as string[]).map((u: string) => (
+                    <Badge key={u} variant="outline" className="bg-purple-50 text-purple-700 border-purple-200 text-xs">
+                      {u}
+                    </Badge>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 text-sm text-blue-600 bg-blue-50 rounded-lg p-2">
+                <Target className="size-4" />
+                <span className="font-medium">Capstone topic — completing this masters the skill!</span>
+              </div>
+            )}
 
             <div className="flex gap-2">
               <Button

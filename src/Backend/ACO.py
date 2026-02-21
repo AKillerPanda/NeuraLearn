@@ -302,7 +302,12 @@ class LearningPathACO:
     # ---- main loop --------------------------------------------------------
     def optimise(self) -> tuple[list[int], float]:
         """
-        Run the ACO.
+        Run the ACO with aggressive early stopping.
+
+        Convergence heuristics (millisecond-speed for typical graphs):
+          • Stagnation detector: stop if the best cost hasn't improved for
+            `patience` consecutive iterations.
+          • Wall-clock time limit (self.time_limit seconds).
 
         Returns
         -------
@@ -311,12 +316,19 @@ class LearningPathACO:
         """
         if self.K == 0:
             return [], 0.0
+        if self.K == 1:
+            # Trivial: only one topic
+            return [int(self._idx_to_id[0])], 0.0
 
         start_time = time.time()
+        patience = max(5, self.k_max // 5)   # stop after N stagnant iterations
+        stagnant = 0
 
         # Pre-allocate walk buffers (reused every ant walk — zero GC)
         visited_buf = np.zeros(self.K, dtype=bool)
         path_buf    = np.empty(self.K, dtype=np.int64)
+
+        prev_best = float("inf")
 
         for iteration in range(self.k_max):
             self._compute_attractiveness()
@@ -338,15 +350,22 @@ class LearningPathACO:
                 if cost < self.best_cost and path_len == self.K:
                     self.best_cost = cost
                     self.best_path = path_buf[:path_len].copy()
-                    logging.info(
-                        "Iteration %d: better path (cost=%.2f)",
-                        iteration, cost,
-                    )
 
             self.history.append(self.best_cost)
 
+            # ── Stagnation check ──────────────────────────────────────
+            if abs(prev_best - self.best_cost) < 1e-6:
+                stagnant += 1
+            else:
+                stagnant = 0
+            prev_best = self.best_cost
+
+            if stagnant >= patience:
+                logging.debug("ACO converged (stagnant %d iters) at iter %d", patience, iteration + 1)
+                break
+
             if time.time() - start_time > self.time_limit:
-                logging.info("Time limit after %d iterations.", iteration + 1)
+                logging.debug("ACO time limit after %d iterations.", iteration + 1)
                 break
 
         # Map dense indices → topic_ids

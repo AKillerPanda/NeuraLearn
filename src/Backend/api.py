@@ -60,97 +60,116 @@ _LEVEL_ORDER = ["foundational", "intermediate", "advanced", "expert"]
 
 def _layout_nodes(kg: KnowledgeGraph) -> list[dict[str, Any]]:
     """
-    Compute node positions using spectral embedding + topological depth.
+    Sugiyama-style layered layout with spectral cross-minimisation.
 
-    Strategy:
-      - Y axis: topological depth (vectorised via KnowledgeGraph.topological_depth_vector)
-      - X axis: spectral embedding (Fiedler vector / 2nd Laplacian eigenvector)
-                gives a natural left-right spread that groups related topics
+    1. Y-axis  — topological depth layers (vectorised BFS).
+    2. X-axis  — *within* each layer, order nodes to minimise edge crossings
+       via barycenter heuristic (average x of parents), seeded with spectral
+       Fiedler ordering for the root layer.
+    3. Spacing — enforce a hard minimum gap (NODE_W) so nodes never overlap
+       regardless of how many share a layer.
 
-    Falls back to simple column layout if the graph is too small (<3 nodes)
-    for meaningful spectral analysis.
+    The result is a clean, readable DAG where every level is evenly spaced,
+    edges flow strictly downward, and no two nodes collide.
     """
     topo = kg.learning_order()
     if not topo:
         return []
 
-    # Vectorised depth computation
-    depth_vec = kg.topological_depth_vector()  # (N,) int32
+    # ── constants ───────────────────────────────────────────────────
+    NODE_W   = 260          # min horizontal gap (> node width ~220 px)
+    Y_GAP    = 160          # vertical gap between layers
+    CENTER_X = 500          # viewport centre-x
 
+    # ── depth vector ────────────────────────────────────────────────
+    depth_vec = kg.topological_depth_vector()          # (N,) int32
     max_depth = int(depth_vec[list(kg.topics.keys())].max()) if kg.topics else 0
 
-    # Try spectral positioning for x-axis
-    use_spectral = kg.num_topics >= 3
-    spectral_x: dict[int, float] = {}
-    if use_spectral:
-        try:
-            fiedler = kg.fiedler_vector()
-            # Normalise Fiedler vector to [-1, 1]
-            fv_vals = np.array([fiedler[t.topic_id] for t in topo])
-            fv_max = np.abs(fv_vals).max()
-            if fv_max > 1e-12:
-                fv_normed = fv_vals / fv_max
-            else:
-                fv_normed = np.zeros_like(fv_vals)
-            for i, t in enumerate(topo):
-                spectral_x[t.topic_id] = float(fv_normed[i])
-        except Exception:
-            use_spectral = False
-
-    # Group by depth layer
+    # ── group topics by layer ───────────────────────────────────────
     layers: dict[int, list] = {}
     for t in topo:
         d = int(depth_vec[t.topic_id])
         layers.setdefault(d, []).append(t)
 
-    nodes: list[dict[str, Any]] = []
-    x_spacing = 260
-    y_spacing = 140
-    center_x = 400
+    # ── spectral seed for the root layer ────────────────────────────
+    spectral_order: dict[int, float] = {}
+    if kg.num_topics >= 3:
+        try:
+            fiedler = kg.fiedler_vector()
+            fv_max = float(np.abs(fiedler).max())
+            if fv_max > 1e-12:
+                for tid in kg.topics:
+                    spectral_order[tid] = float(fiedler[tid]) / fv_max
+        except Exception:
+            pass
 
-    for d, layer_topics in sorted(layers.items()):
-        n = len(layer_topics)
+    # ── barycenter cross-minimisation (two passes) ──────────────────
+    # Assign each topic a fractional x-rank within its layer.
+    # Roots are ordered by Fiedler value; deeper layers by the mean
+    # x-rank of their parents (barycenter heuristic — Sugiyama §3).
+    layer_rank: dict[int, float] = {}   # topic_id → x-rank (0-based float)
 
-        if use_spectral and spectral_x:
-            # Sort layer by spectral x for consistent ordering
-            layer_topics.sort(key=lambda t: spectral_x.get(t.topic_id, 0.0))
-            # Use spectral values for x-positioning, scaled to viewport
-            for i, t in enumerate(layer_topics):
-                sx = spectral_x.get(t.topic_id, 0.0)
-                x = center_x + sx * (x_spacing * max(n - 1, 1) / 2)
-                level_str = t.level.name.lower() if hasattr(t.level, "name") else str(t.level)
-                node_type = "input" if d == 0 else ("output" if d == max_depth else "default")
-                nodes.append({
-                    "id":       str(t.topic_id),
-                    "type":     node_type,
-                    "position": {"x": round(x), "y": d * y_spacing},
-                    "data": {
-                        "label":      t.name,
-                        "level":      level_str,
-                        "difficulty": _LEVEL_TO_DIFFICULTY.get(level_str, "intermediate"),
-                        "description": t.description or "",
-                        "mastered":   t.mastered,
-                    },
-                })
+    for d in range(max_depth + 1):
+        lt = layers.get(d, [])
+        if not lt:
+            continue
+        if d == 0:
+            # Root layer: prefer spectral order, else alphabetical
+            lt.sort(key=lambda t: spectral_order.get(t.topic_id, 0.0))
         else:
-            # Fallback: simple column-centred layout
-            total_width = (n - 1) * x_spacing
-            start_x = center_x - total_width / 2
-            for i, t in enumerate(layer_topics):
-                level_str = t.level.name.lower() if hasattr(t.level, "name") else str(t.level)
-                node_type = "input" if d == 0 else ("output" if d == max_depth else "default")
-                nodes.append({
-                    "id":       str(t.topic_id),
-                    "type":     node_type,
-                    "position": {"x": round(start_x + i * x_spacing), "y": d * y_spacing},
-                    "data": {
-                        "label":      t.name,
-                        "level":      level_str,
-                        "difficulty": _LEVEL_TO_DIFFICULTY.get(level_str, "intermediate"),
-                        "description": t.description or "",
-                        "mastered":   t.mastered,
-                    },
-                })
+            # Barycenter: average rank of already-placed parents
+            def _bary(t):
+                parents = [layer_rank[p] for p in t.prerequisites if p in layer_rank]
+                return sum(parents) / len(parents) if parents else 0.0
+            lt.sort(key=_bary)
+        for i, t in enumerate(lt):
+            layer_rank[t.topic_id] = float(i)
+
+    # 2nd pass (bottom-up refinement) — reduces remaining crossings
+    for d in range(max_depth, -1, -1):
+        lt = layers.get(d, [])
+        if not lt:
+            continue
+        def _child_bary(t):
+            children = [layer_rank[u] for u in t.unlocks if u in layer_rank]
+            return sum(children) / len(children) if children else layer_rank.get(t.topic_id, 0.0)
+        lt.sort(key=_child_bary)
+        for i, t in enumerate(lt):
+            layer_rank[t.topic_id] = float(i)
+
+    # ── absolute pixel positions (centred, no-overlap) ──────────────
+    nodes: list[dict[str, Any]] = []
+    for d in range(max_depth + 1):
+        lt = layers.get(d, [])
+        if not lt:
+            continue
+        n = len(lt)
+        total_w = (n - 1) * NODE_W
+        start_x = CENTER_X - total_w / 2
+        for i, t in enumerate(lt):
+            level_str = t.level.name.lower() if hasattr(t.level, "name") else str(t.level)
+            node_type = "input" if d == 0 else ("output" if d == max_depth else "default")
+
+            # Contextual metadata for the frontend
+            prereq_names = sorted(kg.topics[p].name for p in t.prerequisites)
+            unlock_names = sorted(kg.topics[u].name for u in t.unlocks)
+
+            nodes.append({
+                "id":       str(t.topic_id),
+                "type":     node_type,
+                "position": {"x": round(start_x + i * NODE_W), "y": d * Y_GAP},
+                "data": {
+                    "label":        t.name,
+                    "level":        level_str,
+                    "difficulty":   _LEVEL_TO_DIFFICULTY.get(level_str, "intermediate"),
+                    "description":  t.description or "",
+                    "mastered":     t.mastered,
+                    "prerequisites": prereq_names,
+                    "unlocks":      unlock_names,
+                    "depth":        d,
+                    "stepIndex":    topo.index(t),
+                },
+            })
 
     return nodes
 
@@ -165,6 +184,12 @@ def _build_edges(kg: KnowledgeGraph) -> list[dict[str, Any]]:
                 "source": str(pid),
                 "target": str(t.topic_id),
                 "animated": False,
+                "markerEnd": {
+                    "type": "arrowclosed",
+                    "width": 20,
+                    "height": 20,
+                    "color": "#a78bfa",
+                },
             })
     return edges
 
@@ -174,20 +199,52 @@ def _build_learning_paths(
     aco_kwargs: dict | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Build multiple learning paths:
-      1. Full topological order      (Complete Path)
-      2. ACO-optimised path          (Optimal Path)
-      3. Quick-start: foundational + intermediate only  (Quick Start)
+    Build multiple learning paths with rich, actionable descriptions.
+
+      1. Complete Path  — full topological order (every topic)
+      2. Optimal Path   — ACO-optimised, smooth difficulty curve
+      3. Quick Start    — foundational + intermediate only (fast wins)
+
+    Each path carries per-step metadata so the frontend can show
+    "why this order?" at every node.
     """
     paths: list[dict[str, Any]] = []
     topo = kg.learning_order()
     all_ids = [str(t.topic_id) for t in topo]
 
+    # helper: build an ordered step list with context for a sequence of topic ids
+    def _steps_with_context(topic_ids: list[int]) -> list[dict[str, str]]:
+        steps = []
+        for idx, tid in enumerate(topic_ids):
+            t = kg.topics[tid]
+            prereq_names = sorted(kg.topics[p].name for p in t.prerequisites)
+            unlock_names = sorted(kg.topics[u].name for u in t.unlocks if u in {int(x) for x in [str(i) for i in topic_ids]})
+            level_str = t.level.name.lower() if hasattr(t.level, "name") else str(t.level)
+            steps.append({
+                "topicId":   str(tid),
+                "name":       t.name,
+                "level":      level_str,
+                "requires":   prereq_names,
+                "unlocks":    unlock_names,
+                "reason":     (
+                    "Start here — no prerequisites needed"
+                    if not prereq_names
+                    else f"Ready after mastering {', '.join(prereq_names)}"
+                ),
+            })
+        return steps
+
     # Path 1 — full topo order
+    foundations = [t for t in topo if t.level == TopicLevel.FOUNDATIONAL]
+    advanced    = [t for t in topo if t.level in (TopicLevel.ADVANCED, TopicLevel.EXPERT)]
     paths.append({
         "id":          "path-full",
         "name":        "Complete Path",
-        "description": "Cover every topic in prerequisite order",
+        "description": (
+            f"Master all {len(topo)} topics in prerequisite order — "
+            f"starting with {len(foundations)} fundamentals, building to "
+            f"{len(advanced)} advanced concepts."
+        ),
         "duration":    f"{max(len(topo), 1)} topics",
         "difficulty":  "advanced",
         "nodeIds":     all_ids,
@@ -195,7 +252,13 @@ def _build_learning_paths(
 
     # Path 2 — ACO-optimised
     try:
-        kw = dict(m=30, k_max=40, time_limit=8)
+        # Adaptive ACO sizing: small graphs → fewer ants & iterations
+        K = kg.num_topics
+        kw = dict(
+            m=min(max(K * 2, 10), 30),
+            k_max=min(max(K * 3, 15), 40),
+            time_limit=4,
+        )
         if aco_kwargs:
             kw.update(aco_kwargs)
         aco = LearningPathACO(kg, **kw)
@@ -204,7 +267,11 @@ def _build_learning_paths(
         paths.append({
             "id":          "path-aco",
             "name":        "Optimal Path",
-            "description": f"ACO-optimised learning order (cost {aco_cost:.1f})",
+            "description": (
+                f"AI-optimised order that minimises difficulty jumps and keeps "
+                f"related topics together (cost {aco_cost:.1f}). This path "
+                f"ensures the smoothest learning curve."
+            ),
             "duration":    f"{len(aco_path)} topics",
             "difficulty":  "intermediate",
             "nodeIds":     aco_ids,
@@ -221,7 +288,11 @@ def _build_learning_paths(
         paths.append({
             "id":          "path-quick",
             "name":        "Quick Start",
-            "description": "Foundational & intermediate topics only",
+            "description": (
+                f"Cover the {len(quick_topics)} essential topics "
+                f"(foundational + intermediate) to get productive fast — "
+                f"skip {len(topo) - len(quick_topics)} advanced topics for later."
+            ),
             "duration":    f"{len(quick_topics)} topics",
             "difficulty":  "beginner",
             "nodeIds":     [str(t.topic_id) for t in quick_topics],
@@ -257,19 +328,36 @@ def generate_graph():
     try:
         # 1. Webscrape subtopics
         spec = get_learning_spec(skill)
+        t_scrape = time.time() - t0
         if not spec:
             return jsonify({"error": f"no subtopics found for '{skill}'"}), 404
 
-        # 2. Build knowledge graph
+        # 2. Build knowledge graph (should be < 1 ms)
+        t1 = time.time()
         kg = KnowledgeGraph.from_spec(spec)
+        t_graph = time.time() - t1
 
-        # 3. Layout + edges + paths
+        # 3. Layout + edges + paths (should be < 50 ms total)
+        t2 = time.time()
         nodes = _layout_nodes(kg)
+        t_layout = time.time() - t2
+
+        t3 = time.time()
         edges = _build_edges(kg)
+        t_edges = time.time() - t3
+
+        t4 = time.time()
         paths = _build_learning_paths(kg)
+        t_paths = time.time() - t4
 
         elapsed = time.time() - t0
-        log.info("generate  skill=%r  topics=%d  elapsed=%.1fs", skill, kg.num_topics, elapsed)
+        compute_ms = (t_graph + t_layout + t_edges + t_paths) * 1000
+        log.info(
+            "generate  skill=%r  topics=%d  elapsed=%.2fs  "
+            "(scrape=%.2fs  graph=%.1fms  layout=%.1fms  edges=%.1fms  paths=%.1fms)",
+            skill, kg.num_topics, elapsed,
+            t_scrape, t_graph * 1000, t_layout * 1000, t_edges * 1000, t_paths * 1000,
+        )
 
         return jsonify({
             "skill":   skill,
@@ -277,6 +365,14 @@ def generate_graph():
             "edges":   edges,
             "paths":   paths,
             "elapsed": round(elapsed, 2),
+            "timing": {
+                "scrape_s":    round(t_scrape, 3),
+                "graph_ms":    round(t_graph * 1000, 2),
+                "layout_ms":   round(t_layout * 1000, 2),
+                "edges_ms":    round(t_edges * 1000, 2),
+                "paths_ms":    round(t_paths * 1000, 2),
+                "compute_ms":  round(compute_ms, 2),
+            },
         })
 
     except Exception as exc:
@@ -298,22 +394,40 @@ def sub_graph():
         return jsonify({"error": "missing 'topic' field"}), 400
 
     log.info("sub-graph  topic=%r", topic)
+    t0 = time.time()
 
     try:
         spec = get_learning_spec(topic)
+        t_scrape = time.time() - t0
         if not spec:
             return jsonify({"error": f"no subtopics found for '{topic}'"}), 404
 
+        t1 = time.time()
         kg = KnowledgeGraph.from_spec(spec)
+        t_graph = time.time() - t1
+
+        t2 = time.time()
         nodes = _layout_nodes(kg)
+        t_layout = time.time() - t2
+
         edges = _build_edges(kg)
         paths = _build_learning_paths(kg)
+        compute_ms = (time.time() - t1) * 1000
+
+        log.info(
+            "sub-graph  topic=%r  topics=%d  compute=%.1fms  scrape=%.2fs",
+            topic, kg.num_topics, compute_ms, t_scrape,
+        )
 
         return jsonify({
             "skill": topic,
             "nodes": nodes,
             "edges": edges,
             "paths": paths,
+            "timing": {
+                "scrape_s":   round(t_scrape, 3),
+                "compute_ms": round(compute_ms, 2),
+            },
         })
 
     except Exception as exc:

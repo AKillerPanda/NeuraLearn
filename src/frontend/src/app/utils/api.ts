@@ -126,6 +126,12 @@ export async function generateKnowledgeGraph(
       ...e,
       style: { stroke: "#a78bfa", strokeWidth: 2 },
       type: "smoothstep",
+      markerEnd: {
+        type: "arrowclosed" as const,
+        width: 20,
+        height: 20,
+        color: "#a78bfa",
+      },
     })),
     paths: raw.paths,
   };
@@ -149,6 +155,12 @@ export async function generateSubGraph(
       ...e,
       style: { stroke: "#a78bfa", strokeWidth: 2 },
       type: "smoothstep",
+      markerEnd: {
+        type: "arrowclosed" as const,
+        width: 20,
+        height: 20,
+        color: "#a78bfa",
+      },
     })),
     paths: raw.paths,
   };
