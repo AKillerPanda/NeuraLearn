@@ -1,7 +1,7 @@
+import numpy as np
 import torch
 from torch_geometric.data import Data
 from torch_geometric.utils import degree
-from typing import Optional
 from collections import deque
 from enum import Enum
 from dataclasses import dataclass, field
@@ -272,7 +272,8 @@ class KnowledgeGraph:
 	def mastery_progress(self) -> float:
 		if not self.topics:
 			return 0.0
-		return sum(1 for t in self.topics.values() if t.mastered) / len(self.topics)
+		mastered = sum(t.mastered for t in self.topics.values())  # bool sums to int
+		return mastered / len(self.topics)
 
 	# ---- learning path (cached topological order) --------------------------
 	def learning_order(self) -> list[Topic]:
@@ -329,22 +330,41 @@ class KnowledgeGraph:
 
 	# ---- graph tensors -----------------------------------------------------
 	def build_edge_index(self) -> torch.Tensor:
-		"""[2, E] tensor  (prerequisite → dependent)."""
+		"""[2, E] tensor  (prerequisite → dependent).  Vectorised construction."""
 		if self._edge_index_cache is not None:
 			return self._edge_index_cache
-		src, dst = [], []
+		# Pre-allocate numpy arrays then zero-copy convert to torch
+		num_edges = sum(len(t.unlocks) for t in self.topics.values())
+		if num_edges == 0:
+			ei = torch.zeros((2, 0), dtype=torch.long, device=self.device)
+			self._edge_index_cache = ei
+			return ei
+		src = np.empty(num_edges, dtype=np.int64)
+		dst = np.empty(num_edges, dtype=np.int64)
+		pos = 0
 		for t in self.topics.values():
-			tid = t.topic_id
-			for uid in t.unlocks:
-				src.append(tid)
-				dst.append(uid)
-		ei = torch.tensor([src, dst], dtype=torch.long, device=self.device)
+			k = len(t.unlocks)
+			if k:
+				src[pos:pos + k] = t.topic_id
+				dst[pos:pos + k] = list(t.unlocks)
+				pos += k
+		ei = torch.from_numpy(np.stack([src, dst])).to(device=self.device)
 		self._edge_index_cache = ei
 		return ei
 
 	def build_feature_matrix(self) -> torch.Tensor:
+		"""(N, F) feature matrix, rows ordered by topic_id."""
 		ordered = [self.topics[tid].features for tid in sorted(self.topics)]
 		return torch.stack(ordered, dim=0).to(self.device)
+
+	def build_adjacency_numpy(self) -> np.ndarray:
+		"""Dense adjacency matrix as numpy float32 array (for external consumers)."""
+		n = max(self.topics) + 1 if self.topics else 0
+		adj = np.zeros((n, n), dtype=np.float32)
+		for t in self.topics.values():
+			if t.unlocks:
+				adj[t.topic_id, list(t.unlocks)] = 1.0
+		return adj
 
 	def out_degree(self) -> torch.Tensor:
 		cached = self._degree_cache.get("out")

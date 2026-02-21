@@ -1,7 +1,5 @@
 import logging
-import random
 import time
-from collections import deque
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,18 +7,21 @@ import numpy as np
 from graph import KnowledgeGraph, TopicLevel
 
 """
-Ant Colony Optimization for Learning Path Discovery
-----------------------------------------------------
+Ant Colony Optimization for Learning Path Discovery  (Vectorised)
+-----------------------------------------------------------------
 Given a KnowledgeGraph (DAG of topics with prerequisite edges), find the
-optimal ordering of topics to study. "Optimal" means:
+optimal ordering of topics to study.  "Optimal" means:
 
-  1. All prerequisite constraints are satisfied (hard constraint).
+  1. All prerequisite constraints are satisfied  (hard constraint).
   2. Difficulty transitions are smooth  (FOUNDATIONAL → INTERMEDIATE → …).
-  3. Closely related topics are studied together (locality bonus).
+  3. Closely related topics are studied together  (locality bonus).
   4. The total "cognitive cost" of the path is minimised.
 
-The ACO places pheromone on (topic_i → topic_j) transitions that appear in
-low-cost paths, guiding future ants toward better orderings.
+Performance notes — vectorised with NumPy:
+  • Cost / prerequisite / heuristic matrices built via broadcasting (no O(n²) Python loops).
+  • Prerequisite-availability check is a single boolean matmul per step.
+  • Path scoring and pheromone deposit use fancy indexing.
+  • Pre-allocated walk buffers are reused across ants to avoid GC pressure.
 """
 
 # ---------------------------------------------------------------------------
@@ -29,53 +30,76 @@ low-cost paths, guiding future ants toward better orderings.
 _LEVEL_COST: dict[TopicLevel, int] = {
     TopicLevel.FOUNDATIONAL: 0,
     TopicLevel.INTERMEDIATE: 1,
-    TopicLevel.ADVANCED: 2,
-    TopicLevel.EXPERT: 3,
+    TopicLevel.ADVANCED:     2,
+    TopicLevel.EXPERT:       3,
 }
 
 
 # ---------------------------------------------------------------------------
-# Cost matrix builder
+# Vectorised matrix construction
 # ---------------------------------------------------------------------------
-def build_cost_matrix(kg: KnowledgeGraph) -> np.ndarray:
+def _build_matrices(
+    kg: KnowledgeGraph,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[int, int], np.ndarray]:
     """
-    Build an N×N cost matrix where cost[i][j] represents the cognitive
-    cost of studying topic j immediately after topic i.
+    Build all dense K×K matrices used by the ACO in one pass.
 
-    Cost components:
-      • difficulty_jump  — penalises big level jumps (e.g. FOUNDATIONAL → EXPERT)
-      • relatedness      — bonus (negative cost) if j is a direct dependent of i
-      • base_cost        — small constant so every transition has non-zero cost
+    Uses dense 0..K-1 indices internally for compact, cache-friendly storage.
+
+    Returns
+    -------
+    cost          (K, K)  float64  cognitive transition cost
+    prereq        (K, K)  bool     prereq[i, j] ⇔ j is a prerequisite of i
+    eta           (K, K)  float64  heuristic desirability (1 / cost)
+    start_weights (K,)    float64  initial-step weights (prefer foundational)
+    id_to_idx     dict    topic_id → dense index 0..K-1
+    idx_to_id     (K,)    int64    dense index → topic_id
     """
-    n = max(kg.topics) + 1 if kg.topics else 0
-    cost = np.full((n, n), 1e6)  # default: unreachable
-
     ids = sorted(kg.topics.keys())
-    for i in ids:
-        ti = kg.topics[i]
-        li = _LEVEL_COST[ti.level]
-        for j in ids:
-            if i == j:
-                continue
-            tj = kg.topics[j]
-            lj = _LEVEL_COST[tj.level]
+    K = len(ids)
+    id_to_idx: dict[int, int] = {tid: i for i, tid in enumerate(ids)}
+    idx_to_id = np.array(ids, dtype=np.int64)
 
-            # difficulty jump penalty  (going backwards is extra costly)
-            diff_jump = (lj - li)
-            if diff_jump < 0:
-                difficulty_cost = abs(diff_jump) * 3.0   # penalise regression
-            else:
-                difficulty_cost = diff_jump * 1.0         # forward is natural
+    if K == 0:
+        empty_f = np.empty((0, 0), dtype=np.float64)
+        return empty_f, np.empty((0, 0), dtype=bool), empty_f, np.empty(0), id_to_idx, idx_to_id
 
-            # relatedness bonus: if j is a direct dependent of i, cheaper
-            relatedness = -0.5 if j in ti.unlocks else 0.0
+    # ---- level vector (one Python pass, then all-vectorised) ---------------
+    level_vec = np.array(
+        [_LEVEL_COST[kg.topics[tid].level] for tid in ids], dtype=np.float64,
+    )
 
-            # base cost
-            base = 1.0
+    # ---- difficulty cost via broadcasting  O(K²) in C ----------------------
+    diff = level_vec[np.newaxis, :] - level_vec[:, np.newaxis]      # (K, K)
+    difficulty_cost = np.where(diff < 0, np.abs(diff) * 3.0, diff)  # regression ×3
 
-            cost[i][j] = base + difficulty_cost + relatedness
+    # ---- relatedness bonus (sparse update) ---------------------------------
+    relatedness = np.zeros((K, K), dtype=np.float64)
+    for i, tid in enumerate(ids):
+        unlocks = kg.topics[tid].unlocks
+        if unlocks:
+            cols = [id_to_idx[u] for u in unlocks if u in id_to_idx]
+            if cols:
+                relatedness[i, cols] = -0.5
 
-    return cost
+    # ---- prerequisite boolean matrix (sparse update) -----------------------
+    prereq = np.zeros((K, K), dtype=bool)
+    for i, tid in enumerate(ids):
+        pset = kg.topics[tid].prerequisites
+        if pset:
+            cols = [id_to_idx[p] for p in pset if p in id_to_idx]
+            if cols:
+                prereq[i, cols] = True
+
+    # ---- final cost & heuristic --------------------------------------------
+    cost = 1.0 + difficulty_cost + relatedness
+    np.fill_diagonal(cost, 1e6)
+    eta = 1.0 / (cost + 1e-10)
+
+    # ---- start weights (foundational preferred) ----------------------------
+    start_weights = 1.0 / (level_vec + 1.0)
+
+    return cost, prereq, eta, start_weights, id_to_idx, idx_to_id
 
 
 # ---------------------------------------------------------------------------
@@ -83,174 +107,214 @@ def build_cost_matrix(kg: KnowledgeGraph) -> np.ndarray:
 # ---------------------------------------------------------------------------
 class LearningPathACO:
     """
-    Ant Colony Optimization that finds the best ordering of topics in a
-    KnowledgeGraph, respecting prerequisite constraints and minimising
-    cognitive cost (smooth difficulty progression, related-topic locality).
+    Ant Colony Optimization over a KnowledgeGraph  (vectorised).
+
+    Internally uses dense 0..K-1 indices for compact, cache-friendly matrices.
+    External API returns topic_ids / topic names.
 
     Parameters
     ----------
-    kg          : KnowledgeGraph to optimise over
-    m           : number of ants per iteration
-    k_max       : maximum iterations
-    alpha       : pheromone importance (higher → follow the colony)
-    beta        : heuristic importance (higher → follow cost matrix)
-    rho         : pheromone evaporation rate  (0 = no evaporation, 1 = full)
-    Q           : pheromone deposit constant
-    time_limit  : wall-clock seconds before early stop
+    kg         : KnowledgeGraph to optimise over
+    m          : number of ants per iteration
+    k_max      : maximum iterations
+    alpha      : pheromone importance (higher → follow the colony)
+    beta       : heuristic importance (higher → follow cost matrix)
+    rho        : evaporation rate  (0 = none, 1 = full)
+    Q          : pheromone deposit constant
+    time_limit : wall-clock seconds before early stop
     """
 
-    def __init__(self, kg: KnowledgeGraph, **kwargs):
+    __slots__ = (
+        "kg", "K",
+        "cost", "prereq", "eta", "_start_weights",
+        "_id_to_idx", "_idx_to_id",
+        "m", "k_max", "alpha", "beta", "rho", "Q", "time_limit",
+        "tau", "A",
+        "history", "best_path", "best_cost",
+        "_rng",
+    )
+
+    def __init__(self, kg: KnowledgeGraph, **kwargs) -> None:
         self.kg = kg
-        self.topic_ids: list[int] = sorted(kg.topics.keys())
-        self.n = max(self.topic_ids) + 1 if self.topic_ids else 0
-        self.num_topics = len(self.topic_ids)
 
-        # build cost & heuristic matrices
-        self.cost_matrix = build_cost_matrix(kg)
-        self.eta = 1.0 / (self.cost_matrix + 1e-10)  # heuristic: inverse cost
+        # Vectorised matrix construction (single pass)
+        (
+            self.cost, self.prereq, self.eta, self._start_weights,
+            self._id_to_idx, self._idx_to_id,
+        ) = _build_matrices(kg)
+        self.K: int = len(self._idx_to_id)
 
-        # ACO hyperparameters
-        self.m = kwargs.get("m", 50)
-        self.k_max = kwargs.get("k_max", 80)
-        self.alpha = kwargs.get("alpha", 1.0)
-        self.beta = kwargs.get("beta", 3.0)
-        self.rho = kwargs.get("rho", 0.85)
-        self.Q = kwargs.get("Q", 10.0)
-        self.time_limit = kwargs.get("time_limit", 10)
+        # Hyper-parameters
+        self.m: int          = kwargs.get("m", 50)
+        self.k_max: int      = kwargs.get("k_max", 80)
+        self.alpha: float    = kwargs.get("alpha", 1.0)
+        self.beta: float     = kwargs.get("beta", 3.0)
+        self.rho: float      = kwargs.get("rho", 0.85)
+        self.Q: float        = kwargs.get("Q", 10.0)
+        self.time_limit: int = kwargs.get("time_limit", 10)
 
-        # pheromone matrix (initialised uniformly)
-        self.tau = np.full((self.n, self.n), 1.0)
+        # Pheromone matrix (K × K, dense)
+        self.tau: np.ndarray = np.ones((self.K, self.K), dtype=np.float64)
+        self.A: np.ndarray   = np.empty_like(self.tau)
 
-        # results tracking
+        # Results
         self.history: list[float] = []
-        self.best_path: list[int] = []
+        self.best_path: np.ndarray = np.empty(0, dtype=np.int64)
         self.best_cost: float = float("inf")
 
-    # ---- prerequisite-aware candidate set ---------------------------------
-    def _get_available(self, visited: set[int]) -> list[int]:
-        """
-        Return topic_ids that are not yet visited AND whose prerequisites
-        have ALL been visited (i.e. "mastered" in this ant's walk).
-        """
-        available = []
-        for tid in self.topic_ids:
-            if tid in visited:
-                continue
-            topic = self.kg.topics[tid]
-            if topic.prerequisites.issubset(visited):
-                available.append(tid)
-        return available
+        # RNG (modern numpy generator)
+        self._rng = np.random.default_rng()
 
-    # ---- attractiveness ----------------------------------------------------
+    # ---- attractiveness (fully vectorised, in-place) ----------------------
     def _compute_attractiveness(self) -> None:
-        """Precompute attractiveness A = tau^alpha * eta^beta."""
-        self.A = (self.tau ** self.alpha) * (self.eta ** self.beta)
+        """A = τ^α · η^β  (element-wise, in-place where possible)."""
+        np.power(self.tau, self.alpha, out=self.A)
+        self.A *= np.power(self.eta, self.beta)
 
-    # ---- single ant walk ---------------------------------------------------
-    def _ant_walk(self) -> tuple[list[int], float]:
+    # ---- prerequisite-aware candidates (vectorised boolean matmul) --------
+    def _get_available(self, visited: np.ndarray) -> np.ndarray:
         """
-        One ant builds a complete learning path by choosing topics one at a
-        time, respecting prerequisites. Returns (path, total_cost).
+        Return dense indices of topics whose prereqs are all visited.
+
+        Parameters
+        ----------
+        visited : (K,) bool — True for topics already in the path.
+
+        Returns
+        -------
+        (M,) int64 — dense indices of available (unlocked & unvisited) topics.
         """
-        visited: set[int] = set()
-        path: list[int] = []
+        # unmet_prereqs[i] = count of prereqs of i that are NOT visited
+        unmet = (self.prereq & ~visited).sum(axis=1)     # (K,)
+        return np.flatnonzero((unmet == 0) & ~visited)
 
-        while len(path) < self.num_topics:
-            candidates = self._get_available(visited)
-            if not candidates:
-                break  # stuck (shouldn't happen in a valid DAG)
+    # ---- single ant walk (buffer-reusing) ---------------------------------
+    def _ant_walk(
+        self,
+        visited_buf: np.ndarray,
+        path_buf: np.ndarray,
+    ) -> tuple[int, float]:
+        """
+        Build one complete learning path.
 
-            if not path:
-                # first topic: use only heuristic (no previous node)
-                weights = [self.eta[0][j] if j < self.n else 1.0 for j in candidates]
+        Writes into pre-allocated *path_buf* and returns
+        (path_length, total_cost).  Buffers are zeroed at entry.
+        """
+        visited_buf[:] = False
+        path_len = 0
+        rng = self._rng
+
+        while path_len < self.K:
+            candidates = self._get_available(visited_buf)
+            if candidates.size == 0:
+                break  # stuck — should not happen on a valid DAG
+
+            if path_len == 0:
+                # First step: prefer foundational topics
+                weights = self._start_weights[candidates]
             else:
-                prev = path[-1]
-                weights = [self.A[prev][j] for j in candidates]
+                # Vectorised row-slice of attractiveness matrix
+                weights = self.A[path_buf[path_len - 1], candidates]
 
-            # ensure all weights are positive
-            min_w = min(weights)
-            if min_w <= 0:
-                weights = [w - min_w + 1e-10 for w in weights]
+            # Ensure strictly positive weights
+            w_min = weights.min()
+            if w_min <= 0.0:
+                weights = weights - w_min + 1e-10
 
-            chosen = random.choices(candidates, weights=weights, k=1)[0]
-            path.append(chosen)
-            visited.add(chosen)
+            # Weighted random selection via cumsum + searchsorted (no Python loop)
+            cumsum = weights.cumsum()
+            r = rng.random() * cumsum[-1]
+            chosen = candidates[np.searchsorted(cumsum, r)]
 
-        # score the path
-        total_cost = self._score_path(path)
-        return path, total_cost
+            path_buf[path_len] = chosen
+            visited_buf[chosen] = True
+            path_len += 1
 
-    # ---- scoring -----------------------------------------------------------
-    def _score_path(self, path: list[int]) -> float:
-        """Total cognitive cost of a learning path."""
-        if len(path) < 2:
-            return 0.0
-        cost = 0.0
-        for i in range(len(path) - 1):
-            cost += self.cost_matrix[path[i]][path[i + 1]]
-        return cost
+        # ---- vectorised scoring -------------------------------------------
+        if path_len < 2:
+            return path_len, 0.0
+        p = path_buf[:path_len]
+        total_cost = float(self.cost[p[:-1], p[1:]].sum())  # fancy indexing
+        return path_len, total_cost
 
-    # ---- pheromone deposit --------------------------------------------------
-    def _deposit_pheromone(self, path: list[int], cost: float) -> None:
-        """Deposit pheromone on edges in this path, inversely proportional to cost."""
-        deposit = self.Q / max(cost, 1e-10)
-        for i in range(len(path) - 1):
-            self.tau[path[i]][path[i + 1]] += deposit
-
-    # ---- main loop ----------------------------------------------------------
+    # ---- main loop --------------------------------------------------------
     def optimise(self) -> tuple[list[int], float]:
         """
-        Run the ACO and return (best_path, best_cost).
-        best_path is a list of topic_ids in optimal learning order.
+        Run the ACO.
+
+        Returns
+        -------
+        best_path : list[int]  topic_ids in optimal learning order
+        best_cost : float      total cognitive transition cost
         """
+        if self.K == 0:
+            return [], 0.0
+
         start_time = time.time()
+
+        # Pre-allocate walk buffers (reused every ant walk — zero GC)
+        visited_buf = np.zeros(self.K, dtype=bool)
+        path_buf    = np.empty(self.K, dtype=np.int64)
 
         for iteration in range(self.k_max):
             self._compute_attractiveness()
 
-            # evaporate pheromone
-            self.tau *= (1 - self.rho)
-            # clamp so pheromone doesn't vanish completely
-            self.tau = np.clip(self.tau, 0.01, None)
+            # Evaporate pheromone (vectorised in-place)
+            self.tau *= (1.0 - self.rho)
+            np.clip(self.tau, 0.01, None, out=self.tau)
 
             for _ in range(self.m):
-                path, cost = self._ant_walk()
+                path_len, cost = self._ant_walk(visited_buf, path_buf)
 
-                # deposit pheromone
-                self._deposit_pheromone(path, cost)
+                # Vectorised pheromone deposit via fancy indexing
+                if path_len >= 2:
+                    deposit = self.Q / max(cost, 1e-10)
+                    p = path_buf[:path_len]
+                    self.tau[p[:-1], p[1:]] += deposit
 
-                # track best
-                if cost < self.best_cost and len(path) == self.num_topics:
+                # Track best
+                if cost < self.best_cost and path_len == self.K:
                     self.best_cost = cost
-                    self.best_path = path
+                    self.best_path = path_buf[:path_len].copy()
                     logging.info(
-                        "Iteration %d: better path found (cost=%.2f)",
+                        "Iteration %d: better path (cost=%.2f)",
                         iteration, cost,
                     )
 
             self.history.append(self.best_cost)
 
-            # time limit
             if time.time() - start_time > self.time_limit:
-                logging.info("Time limit reached after %d iterations.", iteration + 1)
+                logging.info("Time limit after %d iterations.", iteration + 1)
                 break
 
-        return self.best_path, self.best_cost
+        # Map dense indices → topic_ids
+        result_ids = self._idx_to_id[self.best_path].tolist() if self.best_path.size else []
+        return result_ids, self.best_cost
 
-    # ---- results ------------------------------------------------------------
+    # ---- results ----------------------------------------------------------
     def get_named_path(self) -> list[str]:
         """Return the best path as a list of topic names."""
-        return [self.kg.topics[tid].name for tid in self.best_path]
+        if self.best_path.size == 0:
+            return []
+        ids = self._idx_to_id[self.best_path]
+        return [self.kg.topics[int(tid)].name for tid in ids]
 
     def print_result(self) -> None:
         """Pretty-print the optimal learning path."""
         print(f"\n{'='*60}")
         print(f"  ACO Optimal Learning Path  (cost: {self.best_cost:.2f})")
         print(f"{'='*60}")
-        for step, tid in enumerate(self.best_path, 1):
-            t = self.kg.topics[tid]
-            prereqs = ", ".join(self.kg.topics[p].name for p in t.prerequisites) or "none"
-            print(f"  {step:>2}. {t.name:<40} [{t.level.name}]  prereqs: {prereqs}")
+        if self.best_path.size == 0:
+            print("  (no path found)")
+        else:
+            ids = self._idx_to_id[self.best_path]
+            for step, tid in enumerate(ids, 1):
+                t = self.kg.topics[int(tid)]
+                prereqs = (
+                    ", ".join(self.kg.topics[p].name for p in t.prerequisites)
+                    or "none"
+                )
+                print(f"  {step:>2}. {t.name:<40} [{t.level.name}]  prereqs: {prereqs}")
         print(f"{'='*60}\n")
 
     def plot_convergence(self, save_path: str | None = None) -> None:
@@ -259,7 +323,10 @@ class LearningPathACO:
             print("No history to plot — run optimise() first.")
             return
         fig, ax = plt.subplots(figsize=(8, 4))
-        ax.plot(range(1, len(self.history) + 1), self.history, marker="o", markersize=3)
+        ax.plot(
+            range(1, len(self.history) + 1), self.history,
+            marker="o", markersize=3,
+        )
         ax.set_xlabel("Iteration")
         ax.set_ylabel("Best Path Cost")
         ax.set_title("ACO Convergence — Learning Path Optimisation")
@@ -289,8 +356,8 @@ def find_optimal_learning_path(
     spec = get_learning_spec(topic)
     kg = KnowledgeGraph.from_spec(spec)
     aco = LearningPathACO(kg, **aco_kwargs)
-    path, cost = aco.optimise()
-    return aco.get_named_path(), cost, aco
+    aco.optimise()
+    return aco.get_named_path(), aco.best_cost, aco
 
 
 # ---------------------------------------------------------------------------
@@ -318,20 +385,14 @@ if __name__ == "__main__":
     composition  = kg.create_topic("Composition",                level=TL.EXPERT)
     process      = kg.create_topic("Process",                    level=TL.EXPERT)
 
-    # prerequisite edges
-    kg.add_prerequisite(overview.topic_id, history.topic_id)
-    kg.add_prerequisite(history.topic_id, communication.topic_id)
-    kg.add_prerequisite(communication.topic_id, manuscripts.topic_id)
-    kg.add_prerequisite(manuscripts.topic_id, science.topic_id)
-    kg.add_prerequisite(science.topic_id, expression.topic_id)
-    kg.add_prerequisite(expression.topic_id, artists.topic_id)
-    kg.add_prerequisite(artists.topic_id, materials.topic_id)
-    kg.add_prerequisite(materials.topic_id, technique.topic_id)
-    kg.add_prerequisite(technique.topic_id, tone.topic_id)
-    kg.add_prerequisite(tone.topic_id, form.topic_id)
-    kg.add_prerequisite(form.topic_id, perspective.topic_id)
-    kg.add_prerequisite(perspective.topic_id, composition.topic_id)
-    kg.add_prerequisite(composition.topic_id, process.topic_id)
+    # prerequisite edges (linear chain)
+    all_topics = [
+        overview, history, communication, manuscripts, science, expression,
+        artists, materials, technique, tone, form, perspective,
+        composition, process,
+    ]
+    edges = [(all_topics[i].topic_id, all_topics[i+1].topic_id) for i in range(len(all_topics)-1)]
+    kg.add_prerequisites_bulk(edges)
 
     print("--- Knowledge Graph ---")
     kg.print_curriculum()
