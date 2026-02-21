@@ -232,8 +232,9 @@ export function KnowledgeGraph() {
         setCompletedNodes(new Set(res.mastered.map((m) => m.id)));
         toast.success("Great progress!", { description: "Topic mastered — server verified" });
         // Log study activity for streak and weekly goal
-        (window as unknown as Record<string, unknown>).__logStudyActivity?.();
-        (window as unknown as Record<string, unknown>).__incrementWeeklyGoal?.();
+        const w = window as unknown as Record<string, (() => void) | undefined>;
+        w.__logStudyActivity?.();
+        w.__incrementWeeklyGoal?.();
       } else {
         toast.error("Prerequisites not met", { description: res.reason ?? "Complete prerequisites first" });
       }
