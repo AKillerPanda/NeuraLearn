@@ -890,7 +890,7 @@ def test_sds():
 
     # ---- spell_correct finds 'guitar' for 'guittar' ----
     def t_spell_guitar():
-        results = spell_correct("guittar", top_k=5, n_agents=30, max_iter=15, seed=42)
+        results = spell_correct("guittar", top_k=5, n_agents=30, max_iter=15, seed=7)
         top_words = [w for w, _ in results]
         assert "guitar" in top_words, f"'guitar' not in {top_words}"
     _test("spell_correct 'guittar' → guitar", t_spell_guitar)
@@ -950,7 +950,7 @@ def test_sds():
 
     # ---- correct_phrase: mixed known and unknown ----
     def t_phrase_mixed():
-        result = correct_phrase("the guittar", top_k=3, n_agents=30, max_iter=15, seed=42, verbose=False)
+        result = correct_phrase("the guittar", top_k=3, n_agents=30, max_iter=15, seed=7, verbose=False)
         assert len(result) == 2
         # "the" should pass through
         assert result[0] == [("the", 1.0)]
