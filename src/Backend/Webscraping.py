@@ -104,19 +104,81 @@ class LearningPlan:
 		print(f"\n{'='*60}")
 
 	def to_dict_list(self) -> list[dict]:
-		"""Export as list of dicts (for feeding into KnowledgeGraph.from_spec)."""
-		result = []
-		prev_name: str | None = None
+		"""
+		Export as a proper DAG spec (not a linear chain).
+
+		Prerequisite logic by difficulty level:
+		  - foundational  : no prerequisites (parallel entry points)
+		  - intermediate  : depends on 1-2 foundational topics
+		  - advanced       : depends on 1-2 intermediate topics
+		  - expert         : depends on 1-2 advanced topics
+
+		Within the same level, consecutive topics share one prerequisite
+		so there's some horizontal connectivity too.  The result is a
+		realistic graph with varying in-degree / out-degree.
+		"""
+		if not self.steps:
+			return []
+
+		# Group steps by level
+		level_order = ["foundational", "intermediate", "advanced", "expert"]
+		by_level: dict[str, list[LearningStep]] = {lv: [] for lv in level_order}
 		for step in self.steps:
-			entry: dict = {
-				"name": step.subtopic,
-				"description": step.description,
-				"level": step.level,
-			}
-			if prev_name is not None:
-				entry["prerequisite_names"] = [prev_name]
-			result.append(entry)
-			prev_name = step.subtopic
+			lv = step.level if step.level in by_level else "foundational"
+			by_level[lv].append(step)
+
+		result: list[dict] = []
+
+		# Track which names exist at each level for prerequisite assignment
+		level_names: dict[str, list[str]] = {lv: [] for lv in level_order}
+
+		for lv_idx, level in enumerate(level_order):
+			steps_at_level = by_level[level]
+			if not steps_at_level:
+				continue
+
+			# Find the previous level that actually has topics
+			prev_level_names: list[str] = []
+			for prev_idx in range(lv_idx - 1, -1, -1):
+				prev_level_names = level_names[level_order[prev_idx]]
+				if prev_level_names:
+					break
+
+			for i, step in enumerate(steps_at_level):
+				entry: dict = {
+					"name": step.subtopic,
+					"description": step.description,
+					"level": level,
+				}
+
+				prereqs: list[str] = []
+
+				if prev_level_names:
+					# Connect to 1-2 topics from the previous level
+					# Spread connections evenly across the previous level
+					n_prev = len(prev_level_names)
+					# Primary prerequisite: map index into previous level
+					primary_idx = (i * n_prev) // max(len(steps_at_level), 1)
+					primary_idx = min(primary_idx, n_prev - 1)
+					prereqs.append(prev_level_names[primary_idx])
+
+					# Secondary prerequisite for fan-in (every other topic)
+					if n_prev >= 2 and i % 2 == 1:
+						secondary_idx = (primary_idx + 1) % n_prev
+						if prev_level_names[secondary_idx] not in prereqs:
+							prereqs.append(prev_level_names[secondary_idx])
+
+				# Horizontal link: 2nd+ topic at same level shares a prereq
+				# with the previous same-level topic (creates within-level edges)
+				if i > 0 and level != "foundational" and not prev_level_names:
+					prereqs.append(steps_at_level[i - 1].subtopic)
+
+				if prereqs:
+					entry["prerequisite_names"] = prereqs
+
+				result.append(entry)
+				level_names[level].append(step.subtopic)
+
 		return result
 
 

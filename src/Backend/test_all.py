@@ -979,12 +979,55 @@ def test_webscraping():
         plan = LearningPlan(topic="Test", summary="A test plan")
         plan.steps.append(LearningStep(1, "Step1", level="foundational"))
         plan.steps.append(LearningStep(2, "Step2", level="intermediate"))
+        plan.steps.append(LearningStep(3, "Step3", level="advanced"))
         dicts = plan.to_dict_list()
-        assert len(dicts) == 2
+        assert len(dicts) == 3
         assert dicts[0]["name"] == "Step1"
-        assert "prerequisite_names" not in dicts[0]  # first has no prereqs
-        assert dicts[1]["prerequisite_names"] == ["Step1"]
-    _test("LearningPlan to_dict_list", t_learning_plan)
+        assert "prerequisite_names" not in dicts[0]  # foundational has no prereqs
+        # Intermediate depends on foundational, advanced depends on intermediate
+        assert "prerequisite_names" in dicts[1], "intermediate should have prereqs"
+        assert "Step1" in dicts[1]["prerequisite_names"], "intermediate should depend on foundational"
+        assert "prerequisite_names" in dicts[2], "advanced should have prereqs"
+        assert "Step2" in dicts[2]["prerequisite_names"], "advanced should depend on intermediate"
+    _test("LearningPlan to_dict_list (DAG structure)", t_learning_plan)
+
+    def t_dag_fan_out():
+        """Verify multi-topic levels create a real DAG with fan-out/fan-in."""
+        plan = LearningPlan(topic="Test")
+        plan.steps = [
+            LearningStep(1, "F1", level="foundational"),
+            LearningStep(2, "F2", level="foundational"),
+            LearningStep(3, "I1", level="intermediate"),
+            LearningStep(4, "I2", level="intermediate"),
+            LearningStep(5, "I3", level="intermediate"),
+            LearningStep(6, "A1", level="advanced"),
+            LearningStep(7, "A2", level="advanced"),
+        ]
+        dicts = plan.to_dict_list()
+        assert len(dicts) == 7
+        # Foundational topics have no prereqs
+        f_topics = [d for d in dicts if d["level"] == "foundational"]
+        for d in f_topics:
+            assert "prerequisite_names" not in d, f"{d['name']} should have no prereqs"
+        # Intermediate topics depend on foundational
+        i_topics = [d for d in dicts if d["level"] == "intermediate"]
+        assert len(i_topics) == 3
+        for d in i_topics:
+            assert "prerequisite_names" in d, f"{d['name']} should have prereqs"
+            for p in d["prerequisite_names"]:
+                assert p in ["F1", "F2"], f"{d['name']} prereq {p} should be foundational"
+        # At least one intermediate topic should have >1 or different prereqs (fan-in)
+        all_prereqs = [tuple(d["prerequisite_names"]) for d in i_topics]
+        # Not all identical — there should be some variety
+        has_variety = len(set(tuple(p) for p in all_prereqs)) > 1 or any(len(p) > 1 for p in all_prereqs)
+        assert has_variety, f"Intermediate prereqs should show fan-in variety: {all_prereqs}"
+        # Advanced depends on intermediate
+        a_topics = [d for d in dicts if d["level"] == "advanced"]
+        for d in a_topics:
+            assert "prerequisite_names" in d
+            for p in d["prerequisite_names"]:
+                assert p in ["I1", "I2", "I3"], f"{d['name']} prereq {p} should be intermediate"
+    _test("DAG fan-out/fan-in structure", t_dag_fan_out)
 
     # ---- _assign_levels ----
     def t_assign_levels_empty():
