@@ -8,8 +8,6 @@ import ReactFlow, {
   Edge,
   useNodesState,
   useEdgesState,
-  Connection,
-  addEdge,
   Panel,
 } from "reactflow";
 import "reactflow/dist/style.css";
@@ -18,9 +16,13 @@ import {
   generateKnowledgeGraph,
   generateSubGraph,
   masterTopic,
+  unmasterTopic,
   getShortestPath,
+  getProgress,
+  exportFlashcards,
+  getStudyStats,
 } from "../utils/api";
-import type { LearningPath, SkillGraphData, LearningResource, GraphStats, ShortestPathStep } from "../utils/api";
+import type { LearningPath, SkillGraphData, LearningResource, GraphStats, ShortestPathStep, StudyStats } from "../utils/api";
 
 import { Button } from "../components/ui/button";
 import {
@@ -38,7 +40,6 @@ import {
   ArrowRight,
   Brain,
   CheckCircle2,
-  ChevronDown,
   Circle,
   Clock,
   Play,
@@ -53,9 +54,12 @@ import {
   ExternalLink,
   BarChart3,
   BookOpen,
-  Lock,
-  Unlock,
   Zap,
+  Timer,
+  Trophy,
+  Download,
+  Moon,
+  Sun,
 } from "lucide-react";
 import { motion } from "motion/react";
 import {
@@ -69,6 +73,8 @@ import { Sheet, SheetContent, SheetTrigger } from "../components/ui/sheet";
 import { toast } from "sonner";
 import { Toaster } from "../components/ui/sonner";
 import { CustomNode } from "../components/CustomNode";
+import { PomodoroTimer } from "../components/PomodoroTimer";
+import { GamificationPanel } from "../components/GamificationPanel";
 
 /* ── Constants (stable ref — defined outside component to avoid re-renders) ── */
 const nodeTypes = { custom: CustomNode } as const;
@@ -102,8 +108,10 @@ export function KnowledgeGraph() {
   const [shortestPath, setShortestPath] = useState<ShortestPathStep[] | null>(null);
   const [shortestPathLoading, setShortestPathLoading] = useState(false);
 
-  /* --- Mastery state (server-synced) --- */
-  const [masteredSet, setMasteredSet] = useState<Set<string>>(new Set());
+  /* --- New features state --- */
+  const [pomodoroSessions, setPomodoroSessions] = useState(0);
+  const [darkMode, setDarkMode] = useState(false);
+  const [studyStats, setStudyStats] = useState<StudyStats | null>(null);
 
   /* --- Fetch graph on mount / skill change --- */
   const fetchGraph = useCallback(async () => {
@@ -122,22 +130,26 @@ export function KnowledgeGraph() {
       toast.success("Knowledge graph generated!", {
         description: `${data.nodes.length} topics found for ${decodedSkill}`,
       });
-    } catch (err: any) {
+
+      // Restore server-side mastery state (if graph was generated before)
+      try {
+        const progress = await getProgress(decodedSkill);
+        if (progress.mastered.length > 0) {
+          setCompletedNodes(new Set(progress.mastered.map((m) => m.id)));
+        }
+      } catch {
+        // First generation — no stored progress yet, that's fine
+      }
+    } catch (err: unknown) {
       setLoadState("error");
-      setErrorMsg(err?.message ?? "Unknown error");
-      toast.error("Generation failed", { description: err?.message });
+      setErrorMsg(err instanceof Error ? err.message : "Unknown error");
+      toast.error("Generation failed", { description: err instanceof Error ? err.message : undefined });
     }
   }, [decodedSkill, setNodes, setEdges]);
 
   useEffect(() => {
     fetchGraph();
   }, [fetchGraph]);
-
-  /* --- Connections --- */
-  const onConnect = useCallback(
-    (params: Connection) => setEdges((eds) => addEdge(params, eds)),
-    [setEdges],
-  );
 
   /* --- Highlight selected path --- */
   useEffect(() => {
@@ -174,18 +186,26 @@ export function KnowledgeGraph() {
   }, [selectedPath, graphData, setNodes, setEdges]);
 
   /* --- Node interactions --- */
-  /* --- Node interactions --- */
   const toggleNodeCompletion = useCallback(async (nodeId: string) => {
     if (!decodedSkill) return;
 
-    // If already mastered locally, just toggle the UI marker
+    // If already mastered locally, un-master on server with cascade
     if (completedNodes.has(nodeId)) {
-      setCompletedNodes((prev) => {
-        const next = new Set(prev);
-        next.delete(nodeId);
-        return next;
-      });
-      toast.info("Progress updated", { description: "Topic marked as incomplete" });
+      try {
+        const res = await unmasterTopic(decodedSkill, nodeId);
+        if (res.success) {
+          setCompletedNodes(new Set(res.mastered.map((m) => m.id)));
+          toast.info("Progress updated", { description: "Topic unmarked (+ dependents)" });
+        }
+      } catch {
+        // Offline fallback
+        setCompletedNodes((prev) => {
+          const next = new Set(prev);
+          next.delete(nodeId);
+          return next;
+        });
+        toast.info("Progress updated", { description: "Topic marked as incomplete (offline)" });
+      }
       return;
     }
 
@@ -193,14 +213,13 @@ export function KnowledgeGraph() {
     try {
       const res = await masterTopic(decodedSkill, nodeId);
       if (res.success) {
-        setCompletedNodes((prev) => new Set([...prev, nodeId]));
-        setMasteredSet(new Set(res.mastered.map((m) => m.id)));
+        setCompletedNodes(new Set(res.mastered.map((m) => m.id)));
         toast.success("Great progress!", { description: "Topic mastered — server verified" });
       } else {
         toast.error("Prerequisites not met", { description: res.reason ?? "Complete prerequisites first" });
       }
     } catch {
-      // Fallback to local toggle if server unavailable
+      // Network error — fallback to local toggle
       setCompletedNodes((prev) => {
         const next = new Set(prev);
         next.add(nodeId);
@@ -225,8 +244,8 @@ export function KnowledgeGraph() {
       const data = await generateSubGraph(label);
       setSubGraphData(data);
       toast.info("Sub-graph generated", { description: `Exploring: ${label}` });
-    } catch (err: any) {
-      toast.error("Sub-graph failed", { description: err?.message });
+    } catch (err: unknown) {
+      toast.error("Sub-graph failed", { description: err instanceof Error ? err.message : undefined });
     } finally {
       setSubGraphLoading(false);
     }
@@ -241,12 +260,48 @@ export function KnowledgeGraph() {
       const path = await getShortestPath(decodedSkill, selectedNode.id);
       setShortestPath(path);
       toast.info("Shortest path found", { description: `${path.length} topics to reach ${selectedNode.data.label}` });
-    } catch (err: any) {
-      toast.error("Shortest path failed", { description: err?.message });
+    } catch (err: unknown) {
+      toast.error("Shortest path failed", { description: err instanceof Error ? err.message : undefined });
     } finally {
       setShortestPathLoading(false);
     }
   }, [selectedNode, decodedSkill]);
+
+  /* --- Flashcard export --- */
+  const handleExportFlashcards = useCallback(async () => {
+    if (!decodedSkill) return;
+    try {
+      const data = await exportFlashcards(decodedSkill);
+      // Download as TSV file
+      const blob = new Blob([data.tsv], { type: "text/tab-separated-values" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${decodedSkill.replace(/\s+/g, "_")}_flashcards.tsv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success(`Exported ${data.count} flashcards!`, {
+        description: "Import the .tsv file into Anki or any flashcard app",
+      });
+    } catch {
+      toast.error("Export failed", { description: "Generate a graph first" });
+    }
+  }, [decodedSkill]);
+
+  /* --- Fetch study stats --- */
+  const fetchStudyStats = useCallback(async () => {
+    if (!decodedSkill) return;
+    try {
+      const stats = await getStudyStats(decodedSkill);
+      setStudyStats(stats);
+    } catch {
+      // Not critical
+    }
+  }, [decodedSkill]);
+
+  useEffect(() => {
+    if (loadState === "done") fetchStudyStats();
+  }, [loadState, fetchStudyStats, completedNodes]);
 
   /* --- Derived --- */
   const difficultyColor = useCallback((d: string) => {
@@ -295,18 +350,26 @@ export function KnowledgeGraph() {
   /* ── Sidebar content (shared between mobile sheet & desktop aside) ── */
   const sidebarContent = graphData ? (
     <Tabs defaultValue="paths" className="h-full">
-      <TabsList className="w-full grid grid-cols-3 rounded-none">
-        <TabsTrigger value="paths" className="gap-2">
-          <Route className="size-4" />
+      <TabsList className="w-full grid grid-cols-5 rounded-none">
+        <TabsTrigger value="paths" className="gap-1 text-[11px] px-1">
+          <Route className="size-3.5" />
           Paths
         </TabsTrigger>
-        <TabsTrigger value="progress" className="gap-2">
-          <Target className="size-4" />
+        <TabsTrigger value="progress" className="gap-1 text-[11px] px-1">
+          <Target className="size-3.5" />
           Progress
         </TabsTrigger>
-        <TabsTrigger value="stats" className="gap-2">
-          <BarChart3 className="size-4" />
+        <TabsTrigger value="stats" className="gap-1 text-[11px] px-1">
+          <BarChart3 className="size-3.5" />
           Stats
+        </TabsTrigger>
+        <TabsTrigger value="timer" className="gap-1 text-[11px] px-1">
+          <Timer className="size-3.5" />
+          Timer
+        </TabsTrigger>
+        <TabsTrigger value="rewards" className="gap-1 text-[11px] px-1">
+          <Trophy className="size-3.5" />
+          Rewards
         </TabsTrigger>
       </TabsList>
 
@@ -676,6 +739,102 @@ export function KnowledgeGraph() {
             })()}
           </div>
         )}
+
+        {/* Study Time Estimation */}
+        {studyStats && (
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm flex items-center gap-1.5">
+                <Clock className="size-3.5 text-green-600" />
+                Study Time Estimate
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2 text-sm">
+              <div className="flex justify-between">
+                <span className="text-gray-600">Total Study Time</span>
+                <span className="font-medium">{studyStats.totalHours}h</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-600">Remaining</span>
+                <span className="font-medium text-amber-600">{studyStats.remainingHours}h</span>
+              </div>
+              <Progress value={studyStats.totalMinutes > 0 ? (studyStats.masteredMinutes / studyStats.totalMinutes) * 100 : 0} className="h-2" />
+              <div className="flex justify-between text-xs text-gray-500">
+                <span>{studyStats.masteredCount} of {studyStats.topicCount} topics done</span>
+                <span>{Math.round((studyStats.masteredMinutes / Math.max(studyStats.totalMinutes, 1)) * 100)}% time saved</span>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Flashcard Export */}
+        <Button
+          variant="outline"
+          size="sm"
+          className="w-full gap-2"
+          onClick={handleExportFlashcards}
+        >
+          <Download className="size-3.5" />
+          Export Flashcards (Anki)
+        </Button>
+      </TabsContent>
+
+      {/* -- Timer tab -- */}
+      <TabsContent value="timer" className="p-4 space-y-3">
+        <div className="mb-2">
+          <h3 className="font-semibold mb-1 flex items-center gap-2">
+            <Timer className="size-4 text-purple-600" />
+            Pomodoro Timer
+          </h3>
+          <p className="text-xs text-gray-500">
+            Stay focused with timed study sessions. 25 min focus, then break.
+          </p>
+        </div>
+        <PomodoroTimer
+          onSessionComplete={() => setPomodoroSessions((n) => n + 1)}
+        />
+
+        {/* Quick tips */}
+        <Card>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm">Study Tips</CardTitle>
+          </CardHeader>
+          <CardContent className="text-xs text-gray-600 space-y-1.5">
+            <p>• Complete one topic per Pomodoro session</p>
+            <p>• Review completed topics during breaks</p>
+            <p>• After 4 sessions, take a 15-min long break</p>
+            <p>• Export flashcards in Stats tab for spaced repetition</p>
+          </CardContent>
+        </Card>
+
+        {/* Study time from stats */}
+        {studyStats && (
+          <div className="rounded-lg border bg-blue-50 p-3 text-center">
+            <p className="text-xs text-blue-600 font-medium">Estimated Total Study Time</p>
+            <p className="text-2xl font-bold text-blue-800">{studyStats.totalHours}h</p>
+            <p className="text-[10px] text-blue-500">
+              ~{Math.ceil(studyStats.remainingMinutes / 25)} Pomodoro sessions remaining
+            </p>
+          </div>
+        )}
+      </TabsContent>
+
+      {/* -- Rewards tab -- */}
+      <TabsContent value="rewards" className="p-4 space-y-3">
+        <div className="mb-2">
+          <h3 className="font-semibold mb-1 flex items-center gap-2">
+            <Trophy className="size-4 text-amber-500" />
+            Achievements & XP
+          </h3>
+          <p className="text-xs text-gray-500">
+            Level up by mastering topics and staying focused
+          </p>
+        </div>
+        <GamificationPanel
+          topicsCompleted={completedNodes.size}
+          totalTopics={graphData.nodes.length}
+          pomodoroSessions={pomodoroSessions}
+        />
       </TabsContent>
     </Tabs>
   ) : null;
@@ -684,11 +843,11 @@ export function KnowledgeGraph() {
   /*  Render                                                          */
   /* ═════════════════════════════════════════════════════════════════ */
   return (
-    <div className="h-screen flex flex-col bg-gray-50">
-      <Toaster />
+    <div className={`h-screen flex flex-col ${darkMode ? "bg-gray-900 text-gray-100" : "bg-gray-50"}`}>
+      <Toaster theme={darkMode ? "dark" : "light"} />
 
       {/* ── Header ─────────────────────────────────────────────────── */}
-      <header className="px-6 py-4 bg-white border-b shadow-sm z-10">
+      <header className={`px-6 py-4 border-b shadow-sm z-10 ${darkMode ? "bg-gray-800 border-gray-700" : "bg-white"}`}>
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4">
             <Button
@@ -738,6 +897,16 @@ export function KnowledgeGraph() {
               <span className="hidden sm:inline">Refresh</span>
             </Button>
 
+            {/* Dark mode toggle */}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setDarkMode(!darkMode)}
+              className="gap-1"
+            >
+              {darkMode ? <Sun className="size-4" /> : <Moon className="size-4" />}
+            </Button>
+
             {selectedPath && (
               <div className="hidden sm:flex items-center gap-4">
                 <div className="text-right">
@@ -756,7 +925,7 @@ export function KnowledgeGraph() {
       {/* ── Body ───────────────────────────────────────────────────── */}
       <div className="flex-1 flex overflow-hidden">
         {/* Desktop sidebar */}
-        <aside className="w-80 bg-white border-r overflow-y-auto hidden lg:block">
+        <aside className={`w-80 border-r overflow-y-auto hidden lg:block ${darkMode ? "bg-gray-800 border-gray-700" : "bg-white"}`}>
           {sidebarContent}
         </aside>
 
@@ -805,7 +974,6 @@ export function KnowledgeGraph() {
               nodeTypes={nodeTypes}
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}
-              onConnect={onConnect}
               onNodeClick={handleNodeClick}
               fitView
               className="bg-gray-50"

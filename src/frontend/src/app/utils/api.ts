@@ -15,7 +15,7 @@
  * All functions return Promises.  The React components use
  * React state + useEffect to handle the async lifecycle.
  */
-import type { Node, Edge } from "reactflow";
+import type { Node, Edge, MarkerType } from "reactflow";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -80,6 +80,29 @@ export interface ShortestPathStep {
   name: string;
   mastered: boolean;
   level: string;
+}
+
+export interface FlashCard {
+  front: string;
+  back: string;
+  tags: string;
+}
+
+export interface FlashCardExport {
+  cards: FlashCard[];
+  tsv: string;
+  count: number;
+}
+
+export interface StudyStats {
+  totalMinutes: number;
+  masteredMinutes: number;
+  remainingMinutes: number;
+  totalHours: number;
+  remainingHours: number;
+  byLevel: Record<string, number>;
+  topicCount: number;
+  masteredCount: number;
 }
 
 /* ------------------------------------------------------------------ */
@@ -171,7 +194,7 @@ export async function generateKnowledgeGraph(
       style: { stroke: "#a78bfa", strokeWidth: 2 },
       type: "smoothstep",
       markerEnd: {
-        type: "arrowclosed" as const,
+        type: "arrowclosed" as MarkerType,
         width: 20,
         height: 20,
         color: "#a78bfa",
@@ -202,7 +225,7 @@ export async function generateSubGraph(
       style: { stroke: "#a78bfa", strokeWidth: 2 },
       type: "smoothstep",
       markerEnd: {
-        type: "arrowclosed" as const,
+        type: "arrowclosed" as MarkerType,
         width: 20,
         height: 20,
         color: "#a78bfa",
@@ -238,6 +261,16 @@ export async function masterTopic(
 }
 
 /**
+ * Un-master a topic (toggle back to incomplete), with cascade.
+ */
+export async function unmasterTopic(
+  skill: string,
+  topicId: string,
+): Promise<MasteryState & { success: boolean }> {
+  return post("/unmaster", { skill, topicId });
+}
+
+/**
  * Get the shortest path (min topics) to reach a target topic.
  */
 export async function getShortestPath(
@@ -266,6 +299,56 @@ export async function getProgress(skill: string): Promise<MasteryState> {
       throw new Error(err.error ?? `API ${res.status}`);
     }
     return res.json() as Promise<MasteryState>;
+  } catch (e: unknown) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error("Request timed out.");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Export flashcards for a stored graph (Anki-compatible).
+ */
+export async function exportFlashcards(skill: string): Promise<FlashCardExport> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${API_BASE}/flashcards/${encodeURIComponent(skill)}`, {
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error ?? `API ${res.status}`);
+    }
+    return res.json() as Promise<FlashCardExport>;
+  } catch (e: unknown) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error("Request timed out.");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Get study time estimation & difficulty breakdown.
+ */
+export async function getStudyStats(skill: string): Promise<StudyStats> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${API_BASE}/study-stats/${encodeURIComponent(skill)}`, {
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error ?? `API ${res.status}`);
+    }
+    return res.json() as Promise<StudyStats>;
   } catch (e: unknown) {
     if (e instanceof DOMException && e.name === "AbortError") {
       throw new Error("Request timed out.");

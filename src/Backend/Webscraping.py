@@ -402,7 +402,6 @@ def get_learning_plan(topic: str) -> LearningPlan:
 	plan = LearningPlan(topic=topic)
 
 	# --- Fetch all sources concurrently ------------------------------------
-	wiki_result = (("", []),)
 	gfg_items: list[dict] = []
 	gh_items: list[dict] = []
 	ddg_items: list[dict] = []

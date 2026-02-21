@@ -1,7 +1,6 @@
 import logging
 import time
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 from graph import KnowledgeGraph, TopicLevel
@@ -403,6 +402,7 @@ class LearningPathACO:
         if not self.history:
             print("No history to plot — run optimise() first.")
             return
+        import matplotlib.pyplot as plt
         fig, ax = plt.subplots(figsize=(8, 4))
         ax.plot(
             range(1, len(self.history) + 1), self.history,

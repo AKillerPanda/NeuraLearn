@@ -6,7 +6,7 @@ from collections import deque
 from enum import Enum
 from dataclasses import dataclass, field
 from scipy import sparse as sp
-from scipy.sparse.linalg import eigsh
+from scipy.sparse.linalg import eigsh, ArpackNoConvergence
 from scipy.sparse.csgraph import connected_components
 
 """
@@ -434,8 +434,8 @@ class KnowledgeGraph:
 				cols.append(t.topic_id)
 		data = np.ones(len(rows), dtype=np.float64)
 		A = sp.csc_matrix((data, (rows, cols)), shape=(n, n), dtype=np.float64)
-		# remove duplicates & self-loops
-		A = A.minimum(sp.csc_matrix(np.ones((n, n))))
+		# remove duplicates by clamping to 1 (sparse-only, no dense matrix)
+		A.data[:] = np.minimum(A.data, 1.0)
 		A.setdiag(0)
 		A.eliminate_zeros()
 		self._laplacian_cache["adj"] = A
@@ -509,7 +509,11 @@ class KnowledgeGraph:
 			vals = np.array([0.0], dtype=np.float64)
 			self._spectral_cache[cache_key] = vals
 			return vals
-		vals, _ = eigsh(L.astype(np.float64), k=k, which="SM", sigma=-0.5)
+		try:
+			vals, _ = eigsh(L.astype(np.float64), k=k, which="SM", sigma=-0.5)
+		except ArpackNoConvergence as exc:
+			# Use whatever eigenvalues ARPACK managed to converge
+			vals = exc.eigenvalues if hasattr(exc, 'eigenvalues') and len(exc.eigenvalues) > 0 else np.array([0.0])
 		vals = np.sort(np.real(vals))
 		self._spectral_cache[cache_key] = vals
 		return vals
@@ -560,7 +564,16 @@ class KnowledgeGraph:
 			v = np.zeros(n, dtype=np.float64)
 			self._spectral_cache[cache_key] = v
 			return v
-		vals_f, vecs_f = eigsh(L.astype(np.float64), k=k, which="SM", sigma=-0.5)
+		try:
+			vals_f, vecs_f = eigsh(L.astype(np.float64), k=k, which="SM", sigma=-0.5)
+		except ArpackNoConvergence as exc:
+			if hasattr(exc, 'eigenvalues') and len(exc.eigenvalues) >= 2:
+				vals_f = exc.eigenvalues
+				vecs_f = exc.eigenvectors
+			else:
+				v = np.zeros(n, dtype=np.float64)
+				self._spectral_cache[cache_key] = v
+				return v
 		order = np.argsort(np.real(vals_f))
 		v = np.real(vecs_f[:, order[1]])
 		self._spectral_cache[cache_key] = v
@@ -590,7 +603,16 @@ class KnowledgeGraph:
 			emb = np.zeros((n, k), dtype=np.float64)
 			self._spectral_cache[cache_key] = emb
 			return emb
-		vals, vecs = eigsh(Ln.astype(np.float64), k=nev, which="SM", sigma=-0.5)
+		try:
+			vals, vecs = eigsh(Ln.astype(np.float64), k=nev, which="SM", sigma=-0.5)
+		except ArpackNoConvergence as exc:
+			if hasattr(exc, 'eigenvalues') and len(exc.eigenvalues) >= 2:
+				vals = exc.eigenvalues
+				vecs = exc.eigenvectors
+			else:
+				emb = np.zeros((n, k), dtype=np.float64)
+				self._spectral_cache[cache_key] = emb
+				return emb
 		order = np.argsort(np.real(vals))
 		# skip the trivial (constant) eigenvector (index 0)
 		emb = np.real(vecs[:, order[1:k + 1]])
@@ -792,9 +814,9 @@ class KnowledgeGraph:
 			for pre_name in spec.prerequisite_names:
 				pre = self.get_topic_by_name(pre_name)
 				if pre is None:
-					raise ValueError(
-						f"prerequisite '{pre_name}' not found for topic '{spec.name}'"
-					)
+					# Webscraping can produce unreliable prerequisite names;
+					# skip silently rather than crashing the whole graph build.
+					continue
 				edges.append((pre.topic_id, topic.topic_id))
 		if edges:
 			self.add_prerequisites_bulk(edges)

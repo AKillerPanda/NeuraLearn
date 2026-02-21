@@ -24,6 +24,8 @@ import logging
 import math
 import time
 import traceback
+import threading
+from collections import OrderedDict
 from typing import Any
 
 import numpy as np
@@ -48,8 +50,28 @@ _dict = load_dictionary()
 log.info("Dictionary loaded: %d words", len(_dict))
 
 # In-memory graph store: skill (lowercased) → (KnowledgeGraph, spec_list)
-# Keeps graphs alive for mastery tracking & shortest-path queries
-_graph_store: dict[str, tuple[KnowledgeGraph, list[dict]]] = {}
+# Keeps graphs alive for mastery tracking & shortest-path queries.
+# Uses OrderedDict with LRU eviction to cap memory at _GRAPH_STORE_MAX entries.
+_GRAPH_STORE_MAX = 50
+_graph_store: OrderedDict[str, tuple[KnowledgeGraph, list[dict]]] = OrderedDict()
+_graph_lock = threading.Lock()
+
+def _store_graph(key: str, value: tuple[KnowledgeGraph, list[dict]]) -> None:
+    """Thread-safe LRU insert into the graph store."""
+    with _graph_lock:
+        if key in _graph_store:
+            _graph_store.move_to_end(key)
+        _graph_store[key] = value
+        while len(_graph_store) > _GRAPH_STORE_MAX:
+            _graph_store.popitem(last=False)
+
+def _get_graph(key: str) -> tuple[KnowledgeGraph, list[dict]] | None:
+    """Thread-safe LRU lookup."""
+    with _graph_lock:
+        entry = _graph_store.get(key)
+        if entry is not None:
+            _graph_store.move_to_end(key)
+        return entry
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -63,6 +85,14 @@ _LEVEL_TO_DIFFICULTY: dict[str, str] = {
 }
 
 _LEVEL_ORDER = ["foundational", "intermediate", "advanced", "expert"]
+
+# Study time estimates in minutes per topic by difficulty level
+_STUDY_TIME_MINUTES: dict[str, int] = {
+    "foundational": 45,
+    "intermediate": 90,
+    "advanced":     150,
+    "expert":       210,
+}
 
 
 def _layout_nodes(kg: KnowledgeGraph, spec: list[dict] | None = None) -> list[dict[str, Any]]:
@@ -86,6 +116,9 @@ def _layout_nodes(kg: KnowledgeGraph, spec: list[dict] | None = None) -> list[di
     topo = kg.learning_order()
     if not topo:
         return []
+
+    # O(1) step-index lookup (avoids O(n²) topo.index())
+    topo_idx: dict[int, int] = {t.topic_id: i for i, t in enumerate(topo)}
 
     # ── constants ───────────────────────────────────────────────────
     NODE_W   = 260          # min horizontal gap (> node width ~220 px)
@@ -199,9 +232,10 @@ def _layout_nodes(kg: KnowledgeGraph, spec: list[dict] | None = None) -> list[di
                     "prerequisites": prereq_names,
                     "unlocks":      unlock_names,
                     "depth":        d,
-                    "stepIndex":    topo.index(t),
+                    "stepIndex":    topo_idx.get(t.topic_id, 0),
                     "cluster":      cluster_map.get(t.topic_id, 0),
                     "resources":    resources,
+                    "estimatedMinutes": _STUDY_TIME_MINUTES.get(level_str, 90),
                 },
             })
 
@@ -282,6 +316,7 @@ def _build_learning_paths(
         "duration":    f"{max(len(topo), 1)} topics",
         "difficulty":  "advanced",
         "nodeIds":     all_ids,
+        "steps":       _steps_with_context([t.topic_id for t in topo]),
     })
 
     # Path 2 — ACO-optimised
@@ -310,6 +345,7 @@ def _build_learning_paths(
             "difficulty":  "intermediate",
             "nodeIds":     aco_ids,
             "convergence": aco.history,
+            "steps":       _steps_with_context(aco_path),
         })
     except Exception as exc:
         log.warning("ACO failed: %s", exc)
@@ -331,6 +367,7 @@ def _build_learning_paths(
             "duration":    f"{len(quick_topics)} topics",
             "difficulty":  "beginner",
             "nodeIds":     [str(t.topic_id) for t in quick_topics],
+            "steps":       _steps_with_context([t.topic_id for t in quick_topics]),
         })
 
     return paths
@@ -407,7 +444,7 @@ def generate_graph():
         t_graph = time.time() - t1
 
         # Store graph for mastery / shortest-path queries
-        _graph_store[skill.lower()] = (kg, spec)
+        _store_graph(skill.lower(), (kg, spec))
 
         # 3. Layout + edges + paths + stats (should be < 50 ms total)
         t2 = time.time()
@@ -493,6 +530,9 @@ def sub_graph():
         stats = _graph_stats(kg)
         compute_ms = (time.time() - t1) * 1000
 
+        # Store sub-graph so mastery/shortest-path work for it too
+        _store_graph(topic.lower(), (kg, spec))
+
         log.info(
             "sub-graph  topic=%r  topics=%d  compute=%.1fms  scrape=%.2fs",
             topic, kg.num_topics, compute_ms, t_scrape,
@@ -570,7 +610,7 @@ def master_topic():
     if not skill or topic_id_str == "":
         return jsonify({"error": "missing 'skill' and/or 'topicId'"}), 400
 
-    entry = _graph_store.get(skill)
+    entry = _get_graph(skill)
     if not entry:
         return jsonify({"error": f"no graph stored for '{skill}' — generate first"}), 404
 
@@ -589,10 +629,15 @@ def master_topic():
             kg.topics[p].name for p in kg.topics[tid].prerequisites
             if not kg.topics[p].mastered
         ]
+        # Return 200 with success=false so the frontend can read the body
         return jsonify({
             "success": False,
             "reason": f"prerequisites not met: {', '.join(missing)}",
-        }), 409
+            "mastered":  [{"id": str(t.topic_id), "name": t.name} for t in kg.get_mastered()],
+            "available": [{"id": str(t.topic_id), "name": t.name} for t in kg.get_available()],
+            "locked":    [{"id": str(t.topic_id), "name": t.name} for t in kg.get_locked()],
+            "progress":  round(kg.mastery_progress(), 4),
+        })
 
     return jsonify({
         "success":   True,
@@ -618,7 +663,7 @@ def shortest_path():
     if not skill or target_str == "":
         return jsonify({"error": "missing 'skill' and/or 'targetId'"}), 400
 
-    entry = _graph_store.get(skill)
+    entry = _get_graph(skill)
     if not entry:
         return jsonify({"error": f"no graph stored for '{skill}' — generate first"}), 404
 
@@ -653,7 +698,7 @@ def get_progress(skill: str):
     Response JSON: { "mastered": [...], "available": [...],
                      "locked": [...], "progress": 0.42 }
     """
-    entry = _graph_store.get(skill.lower())
+    entry = _get_graph(skill.lower())
     if not entry:
         return jsonify({"error": f"no graph stored for '{skill}'"}), 404
 
@@ -663,6 +708,146 @@ def get_progress(skill: str):
         "available": [{"id": str(t.topic_id), "name": t.name} for t in kg.get_available()],
         "locked":    [{"id": str(t.topic_id), "name": t.name} for t in kg.get_locked()],
         "progress":  round(kg.mastery_progress(), 4),
+    })
+
+
+@app.route("/api/unmaster", methods=["POST"])
+def unmaster_topic():
+    """
+    Un-master a topic (toggle back to incomplete).
+
+    Request JSON:  { "skill": "Machine Learning", "topicId": "3" }
+    Response JSON: { "success": true, "mastered": [...], ... }
+    """
+    body = request.get_json(silent=True) or {}
+    skill = (body.get("skill") or "").strip().lower()
+    topic_id_str = body.get("topicId", "")
+
+    if not skill or topic_id_str == "":
+        return jsonify({"error": "missing 'skill' and/or 'topicId'"}), 400
+
+    entry = _get_graph(skill)
+    if not entry:
+        return jsonify({"error": f"no graph stored for '{skill}' — generate first"}), 404
+
+    kg, _ = entry
+    try:
+        tid = int(topic_id_str)
+    except (ValueError, TypeError):
+        return jsonify({"error": f"invalid topicId: {topic_id_str}"}), 400
+
+    if tid not in kg.topics:
+        return jsonify({"error": f"topic {tid} not found in graph"}), 404
+
+    # Un-master this topic and cascade: any dependent that required this
+    # should also be un-mastered to maintain prerequisite invariant.
+    def _cascade_unmaster(t_id: int) -> None:
+        kg.topics[t_id].mastered = False
+        for uid in kg.topics[t_id].unlocks:
+            if kg.topics[uid].mastered:
+                _cascade_unmaster(uid)
+
+    _cascade_unmaster(tid)
+
+    return jsonify({
+        "success":   True,
+        "mastered":  [{"id": str(t.topic_id), "name": t.name} for t in kg.get_mastered()],
+        "available": [{"id": str(t.topic_id), "name": t.name} for t in kg.get_available()],
+        "locked":    [{"id": str(t.topic_id), "name": t.name} for t in kg.get_locked()],
+        "progress":  round(kg.mastery_progress(), 4),
+    })
+
+
+@app.route("/api/flashcards/<skill>", methods=["GET"])
+def export_flashcards(skill: str):
+    """
+    Export the knowledge graph as Anki-compatible flashcards.
+
+    Each topic becomes a flashcard with:
+      - Front: topic name + level
+      - Back: description + prerequisites + what it unlocks
+    Returns JSON array that can be pasted into Anki or downloaded as TSV.
+    """
+    entry = _get_graph(skill.lower())
+    if not entry:
+        return jsonify({"error": f"no graph stored for '{skill}'"}), 404
+
+    kg, spec = entry
+    resource_map: dict[str, list[dict]] = {}
+    if spec:
+        for s in spec:
+            key = s.get("name", "").lower()
+            resource_map[key] = s.get("resources", [])
+
+    cards: list[dict[str, str]] = []
+    for t in kg.learning_order():
+        prereq_names = sorted(kg.topics[p].name for p in t.prerequisites)
+        unlock_names = sorted(kg.topics[u].name for u in t.unlocks)
+        level_str = t.level.name.lower() if hasattr(t.level, "name") else str(t.level)
+        resources = resource_map.get(t.name.lower(), [])
+
+        front = f"{t.name} [{level_str}]"
+        back_parts = []
+        if t.description:
+            back_parts.append(t.description)
+        if prereq_names:
+            back_parts.append(f"Prerequisites: {', '.join(prereq_names)}")
+        if unlock_names:
+            back_parts.append(f"Unlocks: {', '.join(unlock_names)}")
+        if resources:
+            links = [f"• {r.get('title', '')} ({r.get('source', '')})" for r in resources[:3]]
+            back_parts.append("Resources:\\n" + "\\n".join(links))
+
+        cards.append({
+            "front": front,
+            "back":  "\\n".join(back_parts) if back_parts else "No description available.",
+            "tags":  f"neuralearn {skill} {level_str}",
+        })
+
+    # Also build TSV for direct Anki import
+    tsv_lines = [f"{c['front']}\\t{c['back']}\\t{c['tags']}" for c in cards]
+
+    return jsonify({
+        "cards": cards,
+        "tsv":   "\\n".join(tsv_lines),
+        "count": len(cards),
+    })
+
+
+@app.route("/api/study-stats/<skill>", methods=["GET"])
+def study_stats(skill: str):
+    """
+    Return study time estimation and difficulty breakdown for a skill.
+    """
+    entry = _get_graph(skill.lower())
+    if not entry:
+        return jsonify({"error": f"no graph stored for '{skill}'"}), 404
+
+    kg, _ = entry
+    topo = kg.learning_order()
+
+    total_minutes = 0
+    by_level: dict[str, int] = {}
+    for t in topo:
+        level_str = t.level.name.lower() if hasattr(t.level, "name") else str(t.level)
+        mins = _STUDY_TIME_MINUTES.get(level_str, 90)
+        total_minutes += mins
+        by_level[level_str] = by_level.get(level_str, 0) + 1
+
+    mastered_minutes = 0
+    for t in kg.get_mastered():
+        level_str = t.level.name.lower() if hasattr(t.level, "name") else str(t.level)
+        mastered_minutes += _STUDY_TIME_MINUTES.get(level_str, 90)
+
+    return jsonify({
+        "totalMinutes":     total_minutes,
+        "masteredMinutes":  mastered_minutes,
+        "remainingMinutes": total_minutes - mastered_minutes,
+        "totalHours":       round(total_minutes / 60, 1),
+        "remainingHours":   round((total_minutes - mastered_minutes) / 60, 1),
+        "byLevel":          by_level,
+        "topicCount":       kg.num_topics,
+        "masteredCount":    len(kg.get_mastered()),
     })
 
 
